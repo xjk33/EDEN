@@ -19,4 +19,4 @@ model = dict(
     # t_weight_static_window=None,  # 可选：如 [100,500] 则禁用动态更新
 )
 
-work_dir = './work_dirs/eden/fcn_diffae_tweight'
+work_dir = './work_dirs/eden/fcn_diffae_tweight_s2'
