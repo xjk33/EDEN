@@ -184,7 +184,9 @@ class TWeightScheduler(nn.Module):
         self.domain = domain
         self.pos_only = pos_only
         self.joint = joint
-        self.apply = apply
+        # 注意：不能命名为 self.apply——会覆盖 nn.Module.apply()，
+        # 导致 model.to(device) / .apply(fn) 递归时 TypeError: 'str' object is not callable
+        self.apply_mode = apply
         self.static_window = static_window
 
         self.register_buffer('t_weight', torch.full((num_bins,), 1.0 / num_bins))
@@ -253,7 +255,7 @@ class TWeightScheduler(nn.Module):
 
     def sample_probs(self, probe: DtProbe) -> Optional[torch.Tensor]:
         """apply='sample'：把桶权重映射为训练网格上的采样分布；否则返回 None。"""
-        if self.apply != 'sample':
+        if self.apply_mode != 'sample':
             return None
         probs = self.t_weight[probe.grid_bin]
         return probs / probs.sum().clamp_min(1e-12)
@@ -261,7 +263,7 @@ class TWeightScheduler(nn.Module):
     def weight_loss(self, loss_per_sample: torch.Tensor, t: torch.Tensor,
                     probe: DtProbe) -> torch.Tensor:
         """apply='loss'：按桶加权 loss；否则均匀聚合。"""
-        if self.apply != 'loss':
+        if self.apply_mode != 'loss':
             return loss_per_sample.mean()
         w = self.t_weight.to(loss_per_sample.device)[probe.t_to_bin(t)]
         return (loss_per_sample * w).sum() / w.sum().clamp_min(1e-12)
