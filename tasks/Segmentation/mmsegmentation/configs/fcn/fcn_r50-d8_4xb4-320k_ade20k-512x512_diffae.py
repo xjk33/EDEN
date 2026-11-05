@@ -40,7 +40,7 @@ model = dict(
 #   PolyLR 的 eta_min=1e-4 而恒定 1e-4，encoder/decoder 比例从 100:1 缩到 1:1。
 #   现改为：FCN 全体恒定 unet_lr × lr_scale = 2e-4，扩散分支 lr_mult=1/lr_scale
 #   回到恒定 1e-4，比例锁死 2:1（SODA ImageNet 消融最优值）。
-#   注意：同调度 FCN 基线对照见 fcn_r50-d8_bs64-320k_ade20k-512x512_baseline.py，
+#   注意：同调度 FCN 基线对照见 fcn_r50-d8_4xb4-320k_ade20k-512x512_baseline.py，
 #   旧 80k/0.01-poly 基线在新 lr 体制下不可比。
 #
 # [改动 2] 训练量：iters 80k→320k（优化步数对齐 DiffAE ffhq64 的 560k 量级）。

@@ -86,6 +86,7 @@ class FCNWithDiffAE(DiffAEMixin, EncoderDecoder):
         diffae_mask_alpha: float = 1.0,
         diffae_mask_dynamic: bool = True,
         diffae_mask_ratio_max: float = 0.3,
+        diffae_pretrain: bool = False,   # True = 预训练模式：跳过 seg 分支，只训扩散 loss
         **kwargs,
     ):
         super().__init__(
@@ -137,6 +138,12 @@ class FCNWithDiffAE(DiffAEMixin, EncoderDecoder):
             **kwargs,
         )
         self.image_size = image_size
+        self.diffae_pretrain = diffae_pretrain
+        if diffae_pretrain:
+            # 预训练没有 seg 分支，hot/cold 选址拿不到任务梯度，只允许 random / 关闭
+            assert diffae_mask_mode == 'random', (
+                'diffae_pretrain=True 时无 seg 梯度，hot/cold 蒙块选址不可用，'
+                '请用 random 或 diffae_mask_ratio=0 关闭蒙块')
 
     def _to_diffae_range(self, x: torch.Tensor) -> torch.Tensor:
         """ImageNet 归一化空间 -> [-1,1] @ image_size²（扩散输入）。"""
@@ -170,14 +177,14 @@ class FCNWithDiffAE(DiffAEMixin, EncoderDecoder):
         # 1) Backbone 前向一次
         feats = self.backbone(inputs)
 
-        # 2) 分割分支
-        seg_feats = self.neck(feats) if self.with_neck else feats
-
+        # 2) 分割分支（预训练模式跳过：encoder 只接收未被任务梯度稀释的去噪信号）
         losses = dict()
-        losses.update(self._decode_head_forward_train(seg_feats, data_samples))
+        if not self.diffae_pretrain:
+            seg_feats = self.neck(feats) if self.with_neck else feats
+            losses.update(self._decode_head_forward_train(seg_feats, data_samples))
 
-        if self.with_auxiliary_head:
-            losses.update(self._auxiliary_head_forward_train(seg_feats, data_samples))
+            if self.with_auxiliary_head:
+                losses.update(self._auxiliary_head_forward_train(seg_feats, data_samples))
 
         # 2.5) 梯度热力图 -> 结构化噪声选址（每步、逐样本；autograd.grad 只取输入梯度、
         #      不写参数梯度、retain 图给后续联合 backward）

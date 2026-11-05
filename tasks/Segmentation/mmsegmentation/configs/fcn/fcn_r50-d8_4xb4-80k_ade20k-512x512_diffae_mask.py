@@ -16,4 +16,4 @@ model = dict(
     diffae_mask_ratio=0.25,         # dynamic 时仅作占位
 )
 
-work_dir = './work_dirs/eden/fcn_diffae_mask_s2'
+work_dir = './work_dirs/eden/fcn_diffae_mask'
