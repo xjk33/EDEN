@@ -27,4 +27,4 @@ model = dict(
     diffae_mask_ratio=0.25,
 )
 
-work_dir = './work_dirs/eden/fcn_diffae_tweight_mask'
+work_dir = './work_dirs/eden/fcn_diffae_tweight_mask_s2'
