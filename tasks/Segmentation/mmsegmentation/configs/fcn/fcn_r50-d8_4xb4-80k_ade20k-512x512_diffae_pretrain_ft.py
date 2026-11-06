@@ -8,6 +8,6 @@ _base_ = ['./fcn_r50-d8_4xb4-80k_ade20k-512x512_diffae.py']
 
 # 预训练 checkpoint（含 backbone/enc_compress/UNet 及 EMA shadow；seg 头是
 # 预训练时的随机初始化，等价于正常新建，无影响）。预训练 iters 改动时同步改文件名。
-load_from = 'work_dirs/eden/fcn_diffae_pretrain/iter_40000.pth'
+load_from = 'work_dirs/eden/diffae_pretrain/iter_40000.pth'
 
-work_dir = './work_dirs/eden/fcn_diffae_pretrain_ft'
+work_dir = './work_dirs/eden/fcn_diffae_pretrain'
