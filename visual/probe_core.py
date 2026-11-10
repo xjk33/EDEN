@@ -31,13 +31,20 @@ IMAGENET_STD = [58.395, 57.12, 57.375]
 # =====================================================================
 # 建模与取数
 # =====================================================================
-def build_model(cfg_path, ckpt=None, device=None):
-    """从 config 建模型（可选加载 checkpoint）。strict=False 兼容旧 ckpt 键名。"""
+def build_model(cfg_path, ckpt=None, device=None, cfg_overrides=None):
+    """从 config 建模型（可选加载 checkpoint）。strict=False 兼容旧 ckpt 键名。
+
+    cfg_overrides: dict，建模前 merge 进 cfg.model——用于让旧 ckpt 的仪器结构
+    与当前代码默认对齐（如 UNet 时代的 run 需 dict(denoiser_type='unet')，
+    否则旧 config 里没这个键、会按新默认建出 DiT，键全对不上）。
+    """
     from mmengine.config import Config
     from mmengine.registry import init_default_scope
     from mmseg.registry import MODELS
 
     cfg = Config.fromfile(cfg_path)
+    if cfg_overrides:
+        cfg.merge_from_dict({'model': cfg_overrides})
     init_default_scope('mmseg')
     model = MODELS.build(cfg.model)
     if ckpt is not None:

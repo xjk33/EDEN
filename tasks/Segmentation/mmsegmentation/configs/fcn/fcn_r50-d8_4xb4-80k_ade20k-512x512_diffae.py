@@ -32,11 +32,22 @@ model = dict(
     #   'ti' = ViT-Ti/16 ≈ 6.7M（默认，比原 UNet 38.2M 弱约 5.7×）
     #   's'  = ViT-S/16  ≈ 25.8M（对照档）    'b' = ViT-B/16 ≈ 100M（对照上限）
     # 换尺寸后对照 D_t 曲线：整体抬升 = 压力成功转移到 z_sem；塌平/噪声化 = 仪器太弱。
+    
     denoiser_type='dit',
     dit_size='ti',
     dit_patch=16,
     dit_mlp_ratio=4.0,
     adaln_hidden_mult=0.25,
+    # ---- 备用：UNet 强仪器（~38M），仅回测旧 ckpt 时启用 ----
+    # 加载 fcn_diffae_unet / fcn_diffae_tweight / fcn_diffae_mask 等 UNet 时代
+    # 的 checkpoint 时，把上面 5 行 DiT 配置换成下面 2 行（数值以该 run 目录里
+    # dump 的 config 为准，下面是当时默认值）：
+    # denoiser_type='unet',
+    # unet_channels=128, unet_channel_mult=(1, 1, 2, 3), num_res_blocks=1,
+    
+    # 并核对 dump config 的 diffae_pred_x0：若为 False（ε 预测时代），下面的
+    # diffae_pred_x0=True 也要一并改回 False。
+    
     num_diffusion_timesteps=1000,
     beta_schedule='linear',
     spaced_timesteps='ddim100',
