@@ -76,6 +76,7 @@ optim_wrapper = dict(
 )
 
 param_scheduler = dict(
+    _delete_=True,   # base 是 list、这里是 dict，合并前需显式丢弃 base 值
     task='{{_base_.param_scheduler}}',
     diffae=[
         dict(type='LinearLR', start_factor=1e-3, by_epoch=False, begin=0, end=2000),
