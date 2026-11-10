@@ -15,13 +15,80 @@ from typing import List, Optional
 
 import torch
 import torch.nn.functional as F
+from mmengine.optim import OptimWrapperDict
 from mmseg.models.segmentors import EncoderDecoder
-from mmseg.registry import MODELS
+from mmseg.registry import (MODELS, OPTIM_WRAPPER_CONSTRUCTORS,
+                            OPTIM_WRAPPERS, OPTIMIZERS)
 
 try:
     from mydiffae.diffae_mixin import DiffAEMixin
 except ImportError:  # 本地仓库内开发（包名 eden）
     from eden.diffae_mixin import DiffAEMixin
+
+
+@OPTIM_WRAPPER_CONSTRUCTORS.register_module(force=True)
+class SplitOptimWrapperConstructor:
+    """
+    双优化器构造器：按参数名前缀把模型参数切给 task / diffae 两个子优化器。
+    diffae_patterns 命中的参数进 'diffae'（AdamW 独立调度），其余全部进
+    'task'（SGD + PolyLR，与 baseline 完全一致）。配合 config 里
+    param_scheduler 的 dict 写法（key 与优化器同名）实现两套独立 lr 体制。
+
+    config 写法：
+        optim_wrapper = dict(
+            constructor='SplitOptimWrapperConstructor',
+            task=dict(optimizer=dict(type='SGD', ...)),
+            diffae=dict(optimizer=dict(type='AdamW', ...)),
+        )
+    """
+
+    def __init__(self, optim_wrapper_cfg: dict, paramwise_cfg=None,
+                 diffae_key: str = 'diffae',
+                 diffae_patterns=('diffae_unet', 'diffae_enc_compress')):
+        assert isinstance(optim_wrapper_cfg, dict), 'optim_wrapper_cfg 必须是 dict'
+        assert diffae_key in optim_wrapper_cfg, \
+            f'optim_wrapper 缺少 {diffae_key!r} 子优化器'
+        others = [k for k in optim_wrapper_cfg if k != diffae_key]
+        assert len(others) == 1, \
+            f'除 {diffae_key} 外应恰有一个 task 子优化器，得到 {others}'
+        self.task_key = others[0]
+        self.diffae_key = diffae_key
+        self.patterns = tuple(diffae_patterns)
+        self.wrapper_cfgs = {k: v.copy() for k, v in optim_wrapper_cfg.items()}
+        if paramwise_cfg:
+            raise NotImplementedError(
+                'SplitOptimWrapperConstructor 不支持 paramwise_cfg：'
+                '参数归属已由名称前缀决定，各分支超参写在各自 optimizer 里')
+
+    def __call__(self, model) -> OptimWrapperDict:
+        if hasattr(model, 'module'):
+            model = model.module
+        splits = {self.task_key: [], self.diffae_key: []}
+        n_task = n_diff = 0
+        for name, p in model.named_parameters():
+            if not p.requires_grad:
+                continue
+            if any(pat in name for pat in self.patterns):
+                splits[self.diffae_key].append(p)
+                n_diff += p.numel()
+            else:
+                splits[self.task_key].append(p)
+                n_task += p.numel()
+        print(f'[SplitOptimWrapperConstructor] task={n_task / 1e6:.1f}M params, '
+              f'{self.diffae_key}={n_diff / 1e6:.1f}M params '
+              f'(patterns={self.patterns})')
+
+        wrappers = {}
+        for key, cfg in self.wrapper_cfgs.items():
+            cfg = cfg.copy()
+            cfg.setdefault('type', 'OptimWrapper')
+            opt_cfg = cfg.pop('optimizer').copy()
+            with OPTIMIZERS.switch_scope_and_registry(None) as registry:
+                opt_cls = registry.get(opt_cfg.pop('type'))
+            optimizer = opt_cls(params=splits[key], **opt_cfg)
+            wrappers[key] = OPTIM_WRAPPERS.build(
+                cfg, default_args=dict(optimizer=optimizer))
+        return OptimWrapperDict(**wrappers)
 
 
 def _add_monitor_keys(losses, diff_out):
@@ -52,6 +119,15 @@ class FCNWithDiffAE(DiffAEMixin, EncoderDecoder):
         cond_dim: int = 512,
         unet_channels: int = 128,
         unet_channel_mult: tuple = (1, 1, 2, 3),
+        # ---- 去噪器选择：'dit'（弱仪器，i-DAE 路线，默认）| 'unet' ----
+        denoiser_type: str = 'dit',
+        dit_size: str = 'ti',   # 'ti'(~6.7M) | 's'(~25.8M) | 'b'(~100M)；表征已解耦到 encoder，仪器只做小
+        dit_dim=None,           # 显式给定则覆盖预设（逐项）
+        dit_depth=None,
+        dit_heads=None,
+        dit_patch: int = 16,
+        dit_mlp_ratio: float = 4.0,
+        adaln_hidden_mult: float = 0.25,
         num_diffusion_timesteps: int = 1000,
         beta_schedule: str = "linear",
         spaced_timesteps: str = "ddim100",
@@ -86,7 +162,6 @@ class FCNWithDiffAE(DiffAEMixin, EncoderDecoder):
         diffae_mask_alpha: float = 1.0,
         diffae_mask_dynamic: bool = True,
         diffae_mask_ratio_max: float = 0.3,
-        diffae_pretrain: bool = False,   # True = 预训练模式：跳过 seg 分支，只训扩散 loss
         **kwargs,
     ):
         super().__init__(
@@ -102,6 +177,14 @@ class FCNWithDiffAE(DiffAEMixin, EncoderDecoder):
             enc_output_dim=enc_output_dim,
             cond_dim=cond_dim,
             unet_channels=unet_channels,
+            denoiser_type=denoiser_type,
+            dit_size=dit_size,
+            dit_dim=dit_dim,
+            dit_depth=dit_depth,
+            dit_heads=dit_heads,
+            dit_patch=dit_patch,
+            dit_mlp_ratio=dit_mlp_ratio,
+            adaln_hidden_mult=adaln_hidden_mult,
             unet_channel_mult=unet_channel_mult,
             num_diffusion_timesteps=num_diffusion_timesteps,
             beta_schedule=beta_schedule,
@@ -138,12 +221,25 @@ class FCNWithDiffAE(DiffAEMixin, EncoderDecoder):
             **kwargs,
         )
         self.image_size = image_size
-        self.diffae_pretrain = diffae_pretrain
-        if diffae_pretrain:
-            # 预训练没有 seg 分支，hot/cold 选址拿不到任务梯度，只允许 random / 关闭
-            assert diffae_mask_mode == 'random', (
-                'diffae_pretrain=True 时无 seg 梯度，hot/cold 蒙块选址不可用，'
-                '请用 random 或 diffae_mask_ratio=0 关闭蒙块')
+
+    # ------------------------------------------------------------------
+    # 双优化器训练步：task（SGD）+ diffae（AdamW）共享一次前向/反传
+    # ------------------------------------------------------------------
+    def train_step(self, data, optim_wrapper):
+        if not isinstance(optim_wrapper, OptimWrapperDict):
+            # 单优化器配置（纯 baseline / 旧实验复现）：走 mmengine 原生路径
+            return super().train_step(data, optim_wrapper)
+        # OptimWrapperDict 没有 update_params/backward，手动编排：
+        # 单次前向、单次反传（seg 与扩散分支共享 backbone，计算图是一张），
+        # 两个子优化器各自 step / zero_grad（各自只持有自己的参数）。
+        data = self.data_preprocessor(data, True)
+        losses = self._run_forward(data, mode='loss')
+        parsed_losses, log_vars = self.parse_losses(losses)
+        next(iter(optim_wrapper.values())).backward(parsed_losses)
+        for wrapper in optim_wrapper.values():
+            wrapper.step()
+            wrapper.zero_grad()
+        return log_vars
 
     def _to_diffae_range(self, x: torch.Tensor) -> torch.Tensor:
         """ImageNet 归一化空间 -> [-1,1] @ image_size²（扩散输入）。"""
@@ -177,14 +273,13 @@ class FCNWithDiffAE(DiffAEMixin, EncoderDecoder):
         # 1) Backbone 前向一次
         feats = self.backbone(inputs)
 
-        # 2) 分割分支（预训练模式跳过：encoder 只接收未被任务梯度稀释的去噪信号）
+        # 2) 分割分支
         losses = dict()
-        if not self.diffae_pretrain:
-            seg_feats = self.neck(feats) if self.with_neck else feats
-            losses.update(self._decode_head_forward_train(seg_feats, data_samples))
+        seg_feats = self.neck(feats) if self.with_neck else feats
+        losses.update(self._decode_head_forward_train(seg_feats, data_samples))
 
-            if self.with_auxiliary_head:
-                losses.update(self._auxiliary_head_forward_train(seg_feats, data_samples))
+        if self.with_auxiliary_head:
+            losses.update(self._auxiliary_head_forward_train(seg_feats, data_samples))
 
         # 2.5) 梯度热力图 -> 结构化噪声选址（每步、逐样本；autograd.grad 只取输入梯度、
         #      不写参数梯度、retain 图给后续联合 backward）

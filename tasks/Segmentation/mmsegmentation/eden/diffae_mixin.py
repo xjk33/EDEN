@@ -23,6 +23,7 @@ from typing import Dict, Any, Optional, Tuple, List
 
 from .sampler import DDIMSampler, space_timesteps
 from .unet import ConditionalUNet
+from .vit_denoiser import ConditionalDiT
 from .t_adaptive import TAdaptive
 from .masking import MaskSelector, MaskApplier
 
@@ -110,6 +111,16 @@ class DiffAEMixin(nn.Module):
         auto_ema: bool = True,
         num_res_blocks: int = 2,
         custom_timestep_sampler: Optional[List[int]] = None,
+        # ---- 去噪器选择：'dit'（弱仪器，i-DAE 路线，默认）| 'unet'（强仪器）----
+        # 注意：属性名保持 diffae_unet 不变（EMA / paramwise custom_keys / 探针 notebook 均引用该名）
+        denoiser_type: str = 'dit',
+        dit_size: str = 'ti',             # 'ti'(~6.7M) | 's'(~25.8M) | 'b'(~100M)；表征已解耦到 encoder，仪器只做小
+        dit_dim: Optional[int] = None,    # 显式给定则覆盖预设（逐项）
+        dit_depth: Optional[int] = None,
+        dit_heads: Optional[int] = None,
+        dit_patch: int = 16,              # i-DAE：patch 16 直接吃像素
+        dit_mlp_ratio: float = 4.0,
+        adaln_hidden_mult: float = 0.25,  # i-DAE：条件 MLP 隐层 = 1/4
         # ---- t 自适应（实现见 t_adaptive.TAdaptive，参数原样透传）----
         t_weight_enabled: bool = False,
         t_weight_warmup_iters: int = 5000,
@@ -154,17 +165,33 @@ class DiffAEMixin(nn.Module):
         else:
             self.diffae_enc_compress = nn.Identity()
 
-        # ---- UNet Decoder (Denoising Network) ----
-        self.diffae_unet = ConditionalUNet(
-            in_channels=in_channels,
-            model_channels=unet_channels,
-            out_channels=in_channels,
-            channel_mult=unet_channel_mult,
-            cond_dim=cond_dim,
-            use_zero_module=use_zero_module,
-            image_size=image_size,
-            num_res_blocks=num_res_blocks,
-        )
+        # ---- Denoising Network：'dit'（弱仪器，默认）或 'unet' ----
+        if denoiser_type == 'dit':
+            self.diffae_unet = ConditionalDiT(
+                in_channels=in_channels,
+                image_size=image_size,
+                patch_size=dit_patch,
+                size=dit_size,
+                dim=dit_dim,
+                depth=dit_depth,
+                num_heads=dit_heads,
+                mlp_ratio=dit_mlp_ratio,
+                cond_dim=cond_dim,
+                adaln_hidden_mult=adaln_hidden_mult,
+            )
+        elif denoiser_type == 'unet':
+            self.diffae_unet = ConditionalUNet(
+                in_channels=in_channels,
+                model_channels=unet_channels,
+                out_channels=in_channels,
+                channel_mult=unet_channel_mult,
+                cond_dim=cond_dim,
+                use_zero_module=use_zero_module,
+                image_size=image_size,
+                num_res_blocks=num_res_blocks,
+            )
+        else:
+            raise ValueError(f"unknown denoiser_type: {denoiser_type}")
 
         # ---- Sampler ----
         use_timesteps = None

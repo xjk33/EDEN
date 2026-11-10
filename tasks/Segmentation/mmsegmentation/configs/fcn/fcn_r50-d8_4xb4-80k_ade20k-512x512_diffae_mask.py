@@ -1,10 +1,10 @@
 # EDEN 消融臂 3/4：DiffAE + 结构化噪声（seg 梯度热力选址 + 软蒙 + 动态幅度）
-# 与 fcn_diffae 的唯一差异：x0 参数化 + 蒙块配置。
+# 与 fcn_diffae 的唯一差异：蒙块配置
+#（DiT 去噪器、x0 预测、i-DAE 式 lr 控制均从 fcn_diffae 继承；
+#  x0 参数化使可见区去噪 + 蒙区靠 z_sem 重构合并为单次 loss）。
 _base_ = ['./fcn_r50-d8_4xb4-80k_ade20k-512x512_diffae.py']
 
 model = dict(
-    # ---- x0 参数化（蒙块主线用 x0：可见区去噪 + 蒙区靠 z_sem 重构，单次 loss）----
-    diffae_pred_x0=True,
     # ---- 结构化噪声 ----
     diffae_mask_mode='hot',         # 蒙 seg 高敏感块（梯度热力选址）
     diffae_mask_patch=16,

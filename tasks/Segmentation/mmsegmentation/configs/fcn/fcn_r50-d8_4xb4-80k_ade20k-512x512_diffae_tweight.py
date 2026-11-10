@@ -1,5 +1,6 @@
 # EDEN 消融臂 2/4：DiffAE + t 自适应（Dt 探针 -> Hedge/EXP3 -> t 采样分布）
-# 与 fcn_diffae 的唯一差异：t_weight_enabled 及配套超参。
+# 与 fcn_diffae 的唯一差异：t_weight_enabled 及配套超参
+#（DiT 去噪器、x0 预测、i-DAE 式 lr 控制均从 fcn_diffae 继承）。
 _base_ = ['./fcn_r50-d8_4xb4-80k_ade20k-512x512_diffae.py']
 
 model = dict(
