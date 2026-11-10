@@ -58,8 +58,9 @@ model = dict(
 # 不做 i-DAE 的 batch/256 线性缩放：该规则只对大 batch（512~16384）有校准，
 #   bs16 外推出的 6e-6 会让 zero-init 仪器长期不合格，污染 z_sem 梯度与 D_t
 #   信号。峰值固定 1e-4、跨任务共享以保证消融可比；要调就扫 lr ∈ [3e-5, 3e-4]。
-# 注意：{{_base_.}} 引用需 mmengine>=0.4；diffae 侧调度的 end=80000 仍与
-#   schedule_80k 绑定，若换训练总长需同步改这里。
+# 注意：{{_base_.}} 引用必须裸写、不加引号（mmengine 在文本层替换时自带
+#   引号；写成 '{{_base_.x}}' 会让占位符带上字面引号、回填静默失败）。
+#   diffae 侧调度的 end=80000 仍与 schedule_80k 绑定，若换训练总长需同步改这里。
 optim_wrapper = dict(
     # _delete_：整体替换 base 的 OptimWrapper，防止其 type/optimizer 键
     # 合并进来破坏构造器的 2-key 断言
@@ -67,7 +68,7 @@ optim_wrapper = dict(
     constructor='SplitOptimWrapperConstructor',
     task=dict(
         type='OptimWrapper',
-        optimizer='{{_base_.optimizer}}',
+        optimizer={{_base_.optimizer}},
         clip_grad=None),
     diffae=dict(
         type='OptimWrapper',
@@ -77,7 +78,7 @@ optim_wrapper = dict(
 
 param_scheduler = dict(
     _delete_=True,   # base 是 list、这里是 dict，合并前需显式丢弃 base 值
-    task='{{_base_.param_scheduler}}',
+    task={{_base_.param_scheduler}},
     diffae=[
         dict(type='LinearLR', start_factor=1e-3, by_epoch=False, begin=0, end=2000),
         dict(type='CosineAnnealingLR', T_max=78000, eta_min=0.0,
