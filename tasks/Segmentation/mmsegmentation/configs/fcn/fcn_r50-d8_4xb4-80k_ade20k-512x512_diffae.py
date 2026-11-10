@@ -86,4 +86,4 @@ param_scheduler = dict(
     ],
 )
 
-work_dir = './work_dirs/eden/fcn_diffae'
+work_dir = './work_dirs/eden/fcn_diffae_vit'
