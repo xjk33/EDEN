@@ -224,14 +224,22 @@ def measure_dt_spectrum(model, batch):
 # =====================================================================
 # 测量 2：meta-gradient 谱（Dt 价值的金标准）
 # =====================================================================
-def measure_meta_grad_spectrum(model, batch):
+def measure_meta_grad_spectrum(model, batch, n_noise=8, seed=0):
     """
     一阶 meta gradient（foMAML 形式）：把 t 的采样权重 w(t) 视为外层变量，
         ∂L_task(θ - α Σ_t w_t ∇L_diff(t)) / ∂w_t  ∝  -⟨∇L_task, ∇L_diff(t)⟩
     内积越大（越同向）= 在该 t 上去噪训练对下游任务的真实增益越大。
     与 Dt 谱的相关性越高，Dt 作为"下游贡献度代理"的价值越高。
 
-    Returns: dict —— rep_t / rep_logsnr / meta / meta_cos（[num_bins] np 数组）
+    方差控制（Dt 的差分配对天然免疫噪声实现，红线是绝对量、需人工补）：
+      - 预抽 n_noise 个噪声、全部桶共用（common random numbers）：
+        桶间比较不再含"换了噪声"的成分，每桶估计仍无偏；
+      - 每桶对 n_noise 个梯度取平均再做内积（线性等价于平均内积），
+        单桶方差 ÷ n_noise；
+      - 噪声来自独立种子的专用生成器，与 Dt 测量的噪声无关——
+        两条谱共用噪声会让波动同向、虚增相关性，独立采样是保守方向。
+
+    Returns: dict —— rep_t / rep_logsnr / bin_edges / meta / meta_cos
     """
     sampler, unet = model.sampler, model.diffae_unet
     probe = model.t_adaptive.probe
@@ -252,19 +260,27 @@ def measure_meta_grad_spectrum(model, batch):
     # cond 带梯度、只算一次；各桶共享其子图，反传 retain_graph 保住它
     cond = make_cond_fn(model, batch['xis'])()
 
+    # CRN：固定种子预抽一组噪声，所有桶共用（CPU 侧生成，与设备/全局 RNG 解耦）
+    gen = torch.Generator().manual_seed(seed)
+    noises = [torch.randn(x.shape, generator=gen).to(device)
+              for _ in range(n_noise)]
+
     meta, meta_cos = [], []
     for bi in range(probe.num_bins):
         t_val = int(probe.bin_rep_t[bi])
         t = torch.full((B,), t_val, device=device, dtype=torch.long)
-        noise = torch.randn_like(x)
-        x_t = sampler.q_sample(x, t, noise)
-        pred = unet(x_t, t, cond)
-        target = x if getattr(sampler, 'predict_x0', False) else noise
-        l_diff = F.mse_loss(pred, target)
-        g_diff = torch.autograd.grad(l_diff, params, allow_unused=True,
-                                     retain_graph=True)
-        g_diff = [torch.zeros_like(p) if g is None else g.detach()
-                  for p, g in zip(params, g_diff)]
+        g_acc = None
+        for noise in noises:
+            x_t = sampler.q_sample(x, t, noise)
+            pred = unet(x_t, t, cond)
+            target = x if getattr(sampler, 'predict_x0', False) else noise
+            l_diff = F.mse_loss(pred, target)
+            g = torch.autograd.grad(l_diff, params, allow_unused=True,
+                                    retain_graph=True)
+            g = [torch.zeros_like(p) if gg is None else gg.detach()
+                 for p, gg in zip(params, g)]
+            g_acc = g if g_acc is None else [a + b for a, b in zip(g_acc, g)]
+        g_diff = [a / n_noise for a in g_acc]
 
         ip = sum((gt * gd).sum() for gt, gd in zip(g_task, g_diff))
         norm_diff = torch.sqrt(sum((g ** 2).sum() for g in g_diff)).clamp_min(1e-12)
@@ -275,16 +291,36 @@ def measure_meta_grad_spectrum(model, batch):
     ab = sampler.alphas_cumprod.detach().cpu().numpy()
     rep_logsnr = np.log(ab / (1.0 - ab))[rep_t]
     return {'rep_t': rep_t, 'rep_logsnr': rep_logsnr,
+            'bin_edges': probe.bin_edges.detach().cpu().numpy(),
             'meta': np.array(meta), 'meta_cos': np.array(meta_cos)}
 
 
-def dt_meta_correlation(dt, mg):
-    """Dt（桶代表 t 处取值）与 meta-grad 的 Spearman / Pearson。"""
-    bin_deps = np.array([dt['deps'][int(np.argmin(np.abs(dt['t'] - t)))]
-                         for t in mg['rep_t']])
-    rho_s, p_s = spearman(bin_deps, mg['meta'])
-    rho_p = pearson(bin_deps, mg['meta'])
-    return rho_s, p_s, rho_p
+# 参与可视化的 Dt 变体（prod/energy 仍被 measure_dt_spectrum 计算，但不入图）
+DT_KEYS = ('deps', 'dx0', 'cos')
+DT_LABELS = {'deps': 'D_eps', 'dx0': 'D_x0', 'cos': 'D_cos'}
+
+
+def dt_meta_correlation(dt, mg, keys=DT_KEYS):
+    """Dt 各变体与 meta-grad 的 Spearman / Pearson。
+    Dt 侧按桶内平均：用在线探针注册的 bin_edges（logSNR 分位桶）把全网格
+    Dt 归入 16 桶取均值——与在线 d_table 的口径一致，且消掉单点取值噪声。
+    Returns: {key: (rho_s, p_s, rho_p)}"""
+    edges = mg['bin_edges']                 # [num_bins+1]，logSNR 升序
+    ls = dt['logsnr']
+    out = {}
+    for key in keys:
+        bin_v = []
+        for i in range(len(edges) - 1):
+            m = (ls >= edges[i]) & (ls <= edges[i + 1]) if i == len(edges) - 2 \
+                else (ls >= edges[i]) & (ls < edges[i + 1])
+            if m.any():
+                bin_v.append(dt[key][m].mean())
+            else:                            # 桶内无网格点（不应发生），退回最近点
+                bin_v.append(dt[key][int(np.argmin(np.abs(dt['t'] - mg['rep_t'][i])))])
+        bin_v = np.array(bin_v)
+        rho_s, p_s = spearman(bin_v, mg['meta'])
+        out[key] = (rho_s, p_s, pearson(bin_v, mg['meta']))
+    return out
 
 
 # =====================================================================
@@ -353,39 +389,45 @@ def _plt():
     return plt
 
 
-def plot_dt_vs_meta(dt, mg=None, title='', save_path=None):
-    """Dt 谱（蓝，全网格）+ meta-grad 谱（红，桶代表 t）双 y 轴合图，标注相关系数。"""
+def plot_dt_vs_meta(dt, mg=None, title='', save_path=None, keys=DT_KEYS):
+    """Dt 谱（deps/dx0/cos 三变体 × t/logSNR 两视图）+ meta-grad 谱（红，桶代表 t）
+    双 y 轴合图，每行左图标注该变体与 meta-grad 的相关系数。
+    Returns: (fig, {key: (rho_s, p_s, rho_p)})"""
     plt = _plt()
-    rho_s = p_s = rho_p = float('nan')
-    if mg is not None:
-        rho_s, p_s, rho_p = dt_meta_correlation(dt, mg)
+    corrs = dt_meta_correlation(dt, mg, keys) if mg is not None else {}
 
-    fig, axes = plt.subplots(1, 2, figsize=(13, 4.4))
-    for ax, x_dt, x_mg, xlab in [
-            (axes[0], dt['t'], mg['rep_t'] if mg else None, 't'),
-            (axes[1], dt['logsnr'], mg['rep_logsnr'] if mg else None, 'log SNR')]:
-        ax.plot(x_dt, dt['deps'], lw=2, color='tab:blue', label='D_eps (Dt)')
-        ax.axhline(0, color='k', ls='--', lw=0.8)
-        ax.set_xlabel(xlab)
-        ax.set_ylabel('D_eps', color='tab:blue')
-        ax.grid(alpha=0.3)
-        if mg is not None:
-            ax2 = ax.twinx()
-            ax2.plot(x_mg, mg['meta'], lw=2, marker='o', ms=4,
-                     color='tab:red', label='meta-grad <g_task, g_diff>')
-            ax2.set_ylabel('meta gradient', color='tab:red')
-            lines = ax.get_lines() + ax2.get_lines()
-            ax.legend(lines, [l.get_label() for l in lines], fontsize=8)
-        else:
-            ax.legend(fontsize=8)
-    suptitle = title
-    if mg is not None:
-        suptitle += f' | Spearman ρ={rho_s:.3f} (p={p_s:.3f}) | Pearson r={rho_p:.3f}'
-    fig.suptitle(suptitle)
+    fig, axes = plt.subplots(len(keys), 2, figsize=(13, 3.6 * len(keys)),
+                             squeeze=False)
+    for row, key in enumerate(keys):
+        for col, (x_dt, x_mg, xlab) in enumerate([
+                (dt['t'], mg['rep_t'] if mg else None, 't'),
+                (dt['logsnr'], mg['rep_logsnr'] if mg else None, 'log SNR')]):
+            ax = axes[row, col]
+            ax.plot(x_dt, dt[key], lw=2, color='tab:blue',
+                    label=f'{DT_LABELS[key]} (Dt)')
+            ax.axhline(0, color='k', ls='--', lw=0.8)
+            ax.set_xlabel(xlab)
+            ax.set_ylabel(DT_LABELS[key], color='tab:blue')
+            ax.grid(alpha=0.3)
+            if mg is not None:
+                ax2 = ax.twinx()
+                ax2.plot(x_mg, mg['meta'], lw=2, marker='o', ms=4,
+                         color='tab:red', label='meta-grad <g_task, g_diff>')
+                ax2.set_ylabel('meta gradient', color='tab:red')
+                lines = ax.get_lines() + ax2.get_lines()
+                ax.legend(lines, [l.get_label() for l in lines], fontsize=8)
+            else:
+                ax.legend(fontsize=8)
+            if mg is not None and col == 0:
+                rho_s, p_s, rho_p = corrs[key]
+                ax.set_title(f'{DT_LABELS[key]} ~ meta-grad: '
+                             f'Spearman ρ={rho_s:.3f} (p={p_s:.3f}) | '
+                             f'Pearson r={rho_p:.3f}', fontsize=10)
+    fig.suptitle(title)
     fig.tight_layout()
     if save_path:
         fig.savefig(save_path, dpi=150)
-    return fig, (rho_s, p_s, rho_p)
+    return fig, corrs
 
 
 def plot_tweight(snap, title='', ts_freq=None, save_path=None):
