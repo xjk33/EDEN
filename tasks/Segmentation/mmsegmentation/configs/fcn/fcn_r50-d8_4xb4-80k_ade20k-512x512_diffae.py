@@ -25,7 +25,9 @@ model = dict(
     type='FCNWithDiffAE',
     # ---- DiffAE 配置 ----
     image_size=128,
-    enc_output_dim=2048,
+    # z_sem = decode head 分类器输入特征（_forward_feature 输出，channels=512）
+    # 的全局池化；enc_output_dim == cond_dim，diffae_enc_compress 退化为 Identity
+    enc_output_dim=512,
     cond_dim=512,
     # ---- DiT 去噪器（弱仪器；属性名仍为 diffae_unet）----
     # 表征已解耦到任务 encoder（z_sem），去噪器只是施加约束的仪器，只做小：

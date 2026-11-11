@@ -19,6 +19,7 @@ from mmengine.optim import OptimWrapperDict
 from mmseg.models.segmentors import EncoderDecoder
 from mmseg.registry import (MODELS, OPTIM_WRAPPER_CONSTRUCTORS,
                             OPTIM_WRAPPERS, OPTIMIZERS)
+from mmseg.utils import add_prefix
 
 try:
     from mydiffae.diffae_mixin import DiffAEMixin
@@ -115,7 +116,7 @@ class FCNWithDiffAE(DiffAEMixin, EncoderDecoder):
         pretrained=None,
         init_cfg=None,
         image_size: int = 128,
-        enc_output_dim: int = 2048,
+        enc_output_dim: int = 512,   # 须等于 decode_head.channels（z_sem 取分类器输入特征）
         cond_dim: int = 512,
         unet_channels: int = 128,
         unet_channel_mult: tuple = (1, 1, 2, 3),
@@ -252,12 +253,15 @@ class FCNWithDiffAE(DiffAEMixin, EncoderDecoder):
         return x
 
     # ------------------------------------------------------------------
-    # 推理/分析路径：encode_diffae 独立过 backbone
-    # 训练时 loss() 不走这里，直接复用 feats[-1]
+    # 推理/分析路径：encode_diffae 独立过 backbone + decode head
+    # 与训练同分布：z_sem = decode head 分类器输入特征（_forward_feature 输出）
+    # 的全局池化——下游任务真正使用的特征，而非 backbone 原始输出
     # ------------------------------------------------------------------
     def encode_diffae(self, x: torch.Tensor) -> torch.Tensor:
         feats = self.backbone(x)
-        z = F.adaptive_avg_pool2d(feats[-1], 1)
+        seg_feats = self.neck(feats) if self.with_neck else feats
+        head_feat = self.decode_head._forward_feature(seg_feats)
+        z = F.adaptive_avg_pool2d(head_feat, 1)
         return z.flatten(1)
 
     # ------------------------------------------------------------------
@@ -273,10 +277,15 @@ class FCNWithDiffAE(DiffAEMixin, EncoderDecoder):
         # 1) Backbone 前向一次
         feats = self.backbone(inputs)
 
-        # 2) 分割分支
+        # 2) 分割分支：手动走 decode head，截获分类器输入特征 head_feat
+        #    （_forward_feature = convs + conv_cat，cls_seg = dropout + conv_seg 1x1；
+        #      与 _decode_head_forward_train 完全等价，loss 键名经 add_prefix 不变）
         losses = dict()
         seg_feats = self.neck(feats) if self.with_neck else feats
-        losses.update(self._decode_head_forward_train(seg_feats, data_samples))
+        head_feat = self.decode_head._forward_feature(seg_feats)      # [B, 512, h, w]
+        seg_logits = self.decode_head.cls_seg(head_feat)
+        losses.update(add_prefix(
+            self.decode_head.loss_by_feat(seg_logits, data_samples), 'decode'))
 
         if self.with_auxiliary_head:
             losses.update(self._auxiliary_head_forward_train(seg_feats, data_samples))
@@ -299,8 +308,10 @@ class FCNWithDiffAE(DiffAEMixin, EncoderDecoder):
                 heatmap = F.adaptive_avg_pool2d(heatmap, self.image_size)        # [B,1,128,128]
             mask = self.mask_selector.select(heatmap)
 
-        # 3) DiffAE 分支：直接复用 feats[-1]，不走 encode_diffae
-        z_sem = F.adaptive_avg_pool2d(feats[-1], 1).flatten(1)
+        # 3) DiffAE 分支：z_sem = head_feat 的全局池化——seg loss 与 diff loss
+        #    在同一表示（下游真正使用的特征）上交汇；enc_output_dim=512 时
+        #    diffae_enc_compress 为 Identity
+        z_sem = F.adaptive_avg_pool2d(head_feat, 1).flatten(1)
         cond = self.diffae_enc_compress(z_sem)
 
         x_diffae = self._to_diffae_range(inputs.detach())

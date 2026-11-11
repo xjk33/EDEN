@@ -76,9 +76,8 @@ def build_val_batch(model, cfg, num_images=16):
         data = model.data_preprocessor(batch, training=False)
         xi = data['inputs'].to(device)
         with torch.no_grad():
-            feats = model.backbone(xi)
-            z = F.adaptive_avg_pool2d(feats[-1], 1).flatten(1)
-            conds.append(model.diffae_enc_compress(z))
+            # 与训练同分布：走模型自己的 encode_diffae（backbone + decode head）
+            conds.append(model.diffae_enc_compress(model.encode_diffae(xi)))
         xd = (xi * std + mean) / 255.0 * 2.0 - 1.0
         xd = F.interpolate(xd, size=(model.image_size, model.image_size),
                            mode='bilinear', align_corners=False)
@@ -113,10 +112,8 @@ def make_cond_fn(model, xis):
     """带梯度的 cond callable：扩散梯度必须能经 z_sem 流回 encoder
     （detach 的 cond 会让 encoder 梯度恒为 0）。"""
     def cond_fn():
-        zs = []
-        for xi in xis:
-            feats = model.backbone(xi)
-            zs.append(F.adaptive_avg_pool2d(feats[-1], 1).flatten(1))
+        # 与训练同分布：经 decode head 的分类器输入特征（encode_diffae 不挂 no_grad，梯度可回流）
+        zs = [model.encode_diffae(xi) for xi in xis]
         return model.diffae_enc_compress(torch.cat(zs, 0))
 
     return cond_fn
