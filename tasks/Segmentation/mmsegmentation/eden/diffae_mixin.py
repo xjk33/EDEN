@@ -26,6 +26,7 @@ from .unet import ConditionalUNet
 from .vit_denoiser import ConditionalDiT
 from .t_adaptive import TAdaptive
 from .masking import MaskSelector, MaskApplier
+from .beta_sampler import ANTSampler
 
 
 class EMAManager:
@@ -146,6 +147,14 @@ class DiffAEMixin(nn.Module):
         diffae_mask_alpha: float = 1.0,   # 软蒙混合强度：0=不蒙, 1=完全均值色
         diffae_mask_dynamic: bool = False,# True = 每图每步 r~U[0, ratio_max]；False = 固定 mask_ratio
         diffae_mask_ratio_max: float = 0.3,
+        # ---- ANTS：可学习 Beta t 采样器（实现见 beta_sampler.py，与 t_weight 互斥）----
+        ants_enabled: bool = False,
+        ants_lr: float = 1e-3,                 # 采样器 Adam lr（原文 1e-3）
+        ants_entropy_coef: float = 1e-2,       # 熵正则（原文 1e-2）
+        ants_interval: int = 40,               # reward 测量间隔 f_s（原文 40）
+        ants_queue: int = 20,                  # reward 队列长度 |Q|（原文 20）
+        ants_rep_timesteps: Tuple[int, ...] = (200, 500, 800),  # 代表时间步集 S（简化：固定 3 点）
+        ants_hidden: int = 256,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -244,6 +253,26 @@ class DiffAEMixin(nn.Module):
         )
         self.mask_applier = MaskApplier(soft=diffae_mask_soft, alpha=diffae_mask_alpha)
 
+        # ---- ANTS：可学习 Beta t 采样器（Kim et al. CVPR 2025 简化复现）----
+        # 与 t_weight 互斥（两者都决定 t 的采样分布）；与 custom_timestep_sampler
+        # 也互斥（t_override 优先级最高，窗口会被静默忽略——这里显式拦住）。
+        self.ants_enabled = ants_enabled
+        self._ants_pending = None           # reward 簿记（去噪器 step 后由 train_step 消费）
+        self._ants_monitor = {}             # 最近一次 REINFORCE 的监控读数（一步延迟）
+        if ants_enabled:
+            assert not t_weight_enabled, \
+                'ANTS 与 t_weight 互斥：两者都决定 t 的采样分布'
+            assert custom_timestep_sampler is None, \
+                'ANTS 与 custom_timestep_sampler 互斥（t_override 会覆盖窗口采样）'
+            self.ants_sampler = ANTSampler(
+                in_channels=in_channels, hidden=ants_hidden,
+                num_timesteps=num_diffusion_timesteps,
+                use_timesteps=self.sampler.use_timesteps,
+                lr=ants_lr, entropy_coef=ants_entropy_coef,
+                interval=ants_interval, queue_size=ants_queue,
+                rep_timesteps=ants_rep_timesteps)
+            self._ants_step = 0
+
         # 配置镜像（adapter / 监控钩子读取用；实现细节都在子模块里）
         self.diffae_pred_x0 = diffae_pred_x0
         self.diffae_mask_ratio = diffae_mask_ratio
@@ -318,12 +347,26 @@ class DiffAEMixin(nn.Module):
         t_probs = self.t_adaptive.on_train_step(
             self.diffae_unet, self.sampler, x_start, cond, training=self.training)
 
+        # ANTS：每步从 Beta(a,b) 采 t（覆盖内部采样）；到 interval 时先测
+        # 更新前 reward 基线（同批图、同 cond、固定代表 t、CRN 噪声配对），
+        # 簿记挂到 self._ants_pending，等去噪器 step 后由 train_step 消费。
+        t_override = None
+        if self.ants_enabled and self.training:
+            t_override, logp, ent, ab = self.ants_sampler.sample(x_start)
+            self._ants_step += 1
+            if self._ants_step % self.ants_sampler.interval == 0:
+                before, noises = self._ants_measure(x_start, cond)
+                self._ants_pending = dict(
+                    x=x_start.detach(), cond=cond.detach(),
+                    logp=logp, ent=ent, ab=ab, before=before, noises=noises)
+
         # 结构化加噪：MaskApplier 把蒙块翻译成 sampler 的输入（软蒙/硬蒙/无蒙）
         loss_kwargs = self.mask_applier.transform(x_start, input_mask)
         losses = self.sampler.training_losses(
             model=self.diffae_unet,
             model_kwargs={"cond": cond},
             t_probs=t_probs,
+            t_override=t_override,
             **loss_kwargs,
         )
 
@@ -338,13 +381,57 @@ class DiffAEMixin(nn.Module):
         w = self.t_adaptive.scheduler.t_weight
         tw_ent = -(w * torch.log(w.clamp_min(1e-12))).sum() / np.log(self.t_adaptive.probe.num_bins)
 
-        return {
+        out = {
             "loss_diffae": loss * self.lambda_diff,
             "z_sem": cond,
             "tw_ent": tw_ent,
             "tw_max": w.max(),
             "zsem_std": cond.std(dim=0).mean().detach(),   # z_sem 存活监控（判据：从 1e-5 回升）
             "ts_mean": t.float().mean().detach(),
+        }
+        if self.ants_enabled:
+            # ANTS 监控：上一次 REINFORCE 的读数（一步延迟，键名无 'loss' 不求和）
+            out.update(self._ants_monitor)
+        return out
+
+    # ------------------------------------------------------------------
+    # ANTS：reward 测量与 REINFORCE 更新（实现语义见 beta_sampler.py 头注释）
+    # ------------------------------------------------------------------
+    @torch.no_grad()
+    def _ants_measure(self, x: torch.Tensor, cond: torch.Tensor,
+                      noises: Optional[List[torch.Tensor]] = None):
+        """在代表时间步集 S 上测 per-sample 扩散 MSE；noises 给定则复用（CRN 配对）。
+        与 DtProbe 同一约定：始终用未蒙块的原始 x_start 测量。
+        Returns: (loss [B, |S|], noises list)"""
+        ls, ns = [], []
+        for i, tau in enumerate(self.ants_sampler.rep_timesteps):
+            t = torch.full((x.shape[0],), int(tau), device=x.device, dtype=torch.long)
+            n = torch.randn_like(x) if noises is None else noises[i]
+            x_t = self.sampler.q_sample(x, t, n)
+            pred = self.diffae_unet(x_t, t, cond)
+            ls.append((pred - x).pow(2).flatten(1).mean(1))
+            ns.append(n)
+        return torch.stack(ls, dim=1), ns
+
+    def ants_after_update(self) -> None:
+        """
+        去噪器优化器 step 之后由 train_step 调用（仅在有 pending 簿记时生效）：
+        测更新后 loss -> reward = L_before - L_after -> REINFORCE 更新采样器。
+        """
+        p = self._ants_pending
+        if p is None:
+            return
+        self._ants_pending = None
+        after, _ = self._ants_measure(p['x'], p['cond'], noises=p['noises'])
+        reward = float((p['before'] - after).mean())
+        self.ants_sampler.reinforce_update(p['logp'], p['ent'], reward)
+        a, b = p['ab']
+        w = self.ants_sampler.reward_queue
+        self._ants_monitor = {
+            'ants_a': a.mean().detach(),
+            'ants_b': b.mean().detach(),
+            'ants_reward': torch.tensor(sum(w) / len(w)),
+            'ants_ent': p['ent'].mean().detach(),
         }
 
     # ------------------------------------------------------------------

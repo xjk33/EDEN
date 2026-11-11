@@ -235,6 +235,7 @@ class DDIMSampler:
         post_mask: Optional[torch.Tensor] = None,   # v2：加噪后再蒙（蒙区输入为 0）
         target_override: Optional[torch.Tensor] = None,  # 软蒙：输入是混合图，目标仍是原始干净图
         t_probs: Optional[torch.Tensor] = None,     # t 采样分布（use_timesteps 上的概率）；None = 均匀
+        t_override: Optional[torch.Tensor] = None,  # 外部直接给定的 t [B]（如 ANTS 采样器）；优先级最高
     ) -> Dict[str, Any]:
         """
         训练损失。返回 loss / noise / x_t / t / pred。
@@ -245,23 +246,27 @@ class DDIMSampler:
         B = x_start.shape[0]
         device = x_start.device
 
-        if t_probs is not None:
-            # 按 t_weight 推导的分布采样（与 loss 权重化期望等价，但每步满强度）
-            t_idx = torch.multinomial(t_probs.to(device), B, replacement=True)
-        elif self.use_custom_timestep_sampler:
-            # 在筛选后的 spaced 索引中均匀采样
-            local_idx = torch.randint(0, self.num_custom_timesteps, (B,), device=device)
-            t_idx = torch.tensor(
-                [self.custom_timestep_indices[i] for i in local_idx],
+        if t_override is not None:
+            # 外部给定 t（ANTS 可学习采样器）：跳过一切内部采样与网格映射
+            t = t_override.to(device=device, dtype=torch.long)
+        else:
+            if t_probs is not None:
+                # 按 t_weight 推导的分布采样（与 loss 权重化期望等价，但每步满强度）
+                t_idx = torch.multinomial(t_probs.to(device), B, replacement=True)
+            elif self.use_custom_timestep_sampler:
+                # 在筛选后的 spaced 索引中均匀采样
+                local_idx = torch.randint(0, self.num_custom_timesteps, (B,), device=device)
+                t_idx = torch.tensor(
+                    [self.custom_timestep_indices[i] for i in local_idx],
+                    device=device, dtype=torch.long,
+                )
+            else:
+                t_idx = torch.randint(0, self.num_sample_steps, (B,), device=device)
+
+            t = torch.tensor(
+                [self.timestep_map[idx.item()] for idx in t_idx],
                 device=device, dtype=torch.long,
             )
-        else:
-            t_idx = torch.randint(0, self.num_sample_steps, (B,), device=device)
-
-        t = torch.tensor(
-            [self.timestep_map[idx.item()] for idx in t_idx],
-            device=device, dtype=torch.long,
-        )
 
         noise = torch.randn_like(x_start)
         x_t = self.q_sample(x_start, t, noise)

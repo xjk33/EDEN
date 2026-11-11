@@ -94,8 +94,10 @@ class SplitOptimWrapperConstructor:
 
 def _add_monitor_keys(losses, diff_out):
     """把监控标量挂到 losses 上。键名不含 'loss'，不参与 loss 求和，只会被记录。
-    tw_*: t 权重熵 / 最大桶权重；zsem_std: z_sem 跨图 std（存活判据）；ts_mean: 采样 t 均值。"""
-    for k in ("tw_ent", "tw_max", "zsem_std", "ts_mean"):
+    tw_*: t 权重熵 / 最大桶权重；zsem_std: z_sem 跨图 std（存活判据）；ts_mean: 采样 t 均值；
+    ants_*: Beta 采样器 (a, b) 均值 / 队列平滑 reward / 采样熵。"""
+    for k in ("tw_ent", "tw_max", "zsem_std", "ts_mean",
+              "ants_a", "ants_b", "ants_reward", "ants_ent"):
         v = diff_out.get(k)
         if v is not None:
             losses[k] = v
@@ -138,6 +140,14 @@ class FCNWithDiffAE(DiffAEMixin, EncoderDecoder):
         auto_ema: bool = True,
         num_res_blocks: int = 1,
         custom_timestep_sampler: Optional[List[int]] = None,
+        # ---- ANTS（透传给 DiffAEMixin -> ANTSampler，与 t_weight/窗口互斥）----
+        ants_enabled: bool = False,
+        ants_lr: float = 1e-3,
+        ants_entropy_coef: float = 1e-2,
+        ants_interval: int = 40,
+        ants_queue: int = 20,
+        ants_rep_timesteps: tuple = (200, 500, 800),
+        ants_hidden: int = 256,
         # ---- t 自适应（透传给 DiffAEMixin -> TAdaptive）----
         t_weight_enabled: bool = False,
         t_weight_warmup_iters: int = 5000,
@@ -196,6 +206,13 @@ class FCNWithDiffAE(DiffAEMixin, EncoderDecoder):
             auto_ema=auto_ema,
             num_res_blocks=num_res_blocks,
             custom_timestep_sampler=custom_timestep_sampler,
+            ants_enabled=ants_enabled,
+            ants_lr=ants_lr,
+            ants_entropy_coef=ants_entropy_coef,
+            ants_interval=ants_interval,
+            ants_queue=ants_queue,
+            ants_rep_timesteps=ants_rep_timesteps,
+            ants_hidden=ants_hidden,
             t_weight_enabled=t_weight_enabled,
             t_weight_warmup_iters=t_weight_warmup_iters,
             t_weight_eta=t_weight_eta,
@@ -240,6 +257,9 @@ class FCNWithDiffAE(DiffAEMixin, EncoderDecoder):
         for wrapper in optim_wrapper.values():
             wrapper.step()
             wrapper.zero_grad()
+        # ANTS：去噪器已更新，消费 reward 簿记、REINFORCE 更新 Beta 采样器
+        # （未启用或未到测量间隔时为空操作）
+        self.ants_after_update()
         return log_vars
 
     def _to_diffae_range(self, x: torch.Tensor) -> torch.Tensor:
