@@ -253,7 +253,10 @@ def measure_meta_grad_spectrum(model, batch, n_noise=8, seed=0):
       - 噪声来自独立种子的专用生成器，与 Dt 测量的噪声无关——
         两条谱共用噪声会让波动同向、虚增相关性，独立采样是保守方向。
 
-    Returns: dict —— rep_t / rep_logsnr / bin_edges / meta / meta_cos
+    Returns: dict —— rep_t / rep_logsnr / bin_edges /
+      meta      单位化内积 ⟨g_task, g_diff/‖g_diff‖⟩（主量，跨 t 可比）
+      meta_raw  裸内积（诊断：含梯度量级随 t 增长的混杂）
+      meta_cos  余弦（与 meta 跨 t 排名相同，尺度再除 ‖g_task‖）
     """
     sampler, unet = model.sampler, model.diffae_unet
     probe = model.t_adaptive.probe
@@ -279,7 +282,7 @@ def measure_meta_grad_spectrum(model, batch, n_noise=8, seed=0):
     noises = [torch.randn(x.shape, generator=gen).to(device)
               for _ in range(n_noise)]
 
-    meta, meta_cos = [], []
+    meta, meta_raw, meta_cos = [], [], []
     for bi in range(probe.num_bins):
         t_val = int(probe.bin_rep_t[bi])
         t = torch.full((B,), t_val, device=device, dtype=torch.long)
@@ -298,7 +301,12 @@ def measure_meta_grad_spectrum(model, batch, n_noise=8, seed=0):
 
         ip = sum((gt * gd).sum() for gt, gd in zip(g_task, g_diff))
         norm_diff = torch.sqrt(sum((g ** 2).sum() for g in g_diff)).clamp_min(1e-12)
-        meta.append(ip.item())
+        # 归一化内积（主量）：⟨g_task, g_diff/‖g_diff‖⟩，"沿该 t 方向走单位步长
+        # 的 task loss 变化"——去噪 loss 量级随 t 天然增长，裸内积把方向对齐度
+        # 和梯度大小混在一起，跨 t 不可比；g_task 固定，只除 ‖g_diff‖ 即可
+        # （再除 ‖g_task‖ 就是 cos，与单位化内积的跨 t 排名完全相同）
+        meta.append((ip / norm_diff).item())
+        meta_raw.append(ip.item())
         meta_cos.append((ip / (norm_task * norm_diff)).item())
 
     rep_t = probe.bin_rep_t.detach().cpu().numpy().astype(int)
@@ -306,7 +314,8 @@ def measure_meta_grad_spectrum(model, batch, n_noise=8, seed=0):
     rep_logsnr = np.log(ab / (1.0 - ab))[rep_t]
     return {'rep_t': rep_t, 'rep_logsnr': rep_logsnr,
             'bin_edges': probe.bin_edges.detach().cpu().numpy(),
-            'meta': np.array(meta), 'meta_cos': np.array(meta_cos)}
+            'meta': np.array(meta), 'meta_raw': np.array(meta_raw),
+            'meta_cos': np.array(meta_cos)}
 
 
 # 参与可视化的 Dt 变体：loss 差直接 + 三个候选/对照形式（x0 预测唯一参数化）
@@ -754,8 +763,8 @@ def plot_dt_vs_meta(dt, mg=None, title='', save_path=None, keys=DT_KEYS):
             if mg is not None:
                 ax2 = ax.twinx()
                 ax2.plot(x_mg, mg['meta'], lw=2, marker='o', ms=4,
-                         color='tab:red', label='meta-grad <g_task, g_diff>')
-                ax2.set_ylabel('meta gradient', color='tab:red')
+                         color='tab:red', label='meta-grad <g_task, ĝ_diff> (unit-norm)')
+                ax2.set_ylabel('meta gradient (unit-norm)', color='tab:red')
                 lines = ax.get_lines() + ax2.get_lines()
                 ax.legend(lines, [l.get_label() for l in lines], fontsize=8)
             else:
