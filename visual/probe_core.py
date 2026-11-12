@@ -169,61 +169,70 @@ def pearson(x, y):
 
 
 # =====================================================================
-# 测量 1：Dt 谱
+# 测量 1：Dt 谱（CRN + 多噪声重复版）
 # =====================================================================
 @torch.no_grad()
-def measure_dt_spectrum(model, batch):
+def measure_dt_spectrum(model, batch, n_noise=8, seed=0):
     """
-    Dt 谱：对训练网格上每个 t，同图同噪声配对测 cond / zero-cond，
-    逐样本算指标取中位数。
-    Returns: dict —— t / logsnr / deps / dx0 / prod / cos / energy（[len(grid)] np 数组）
+    Dt 谱。可靠性设计（目标：估计噪声不再污染曲线形状与跨 ckpt 比较）：
+      - 预抽 n_noise 个噪声（专用种子生成器），全部 t 共用（CRN）：
+        逐 t 抖动不再含"换了噪声"的成分；跨 ckpt 用同组噪声，严格可比；
+      - 每 t 有效样本 = n_noise × B（默认 8×16=128），均值类估计噪声
+        较单实现降 √128 ≈ 11×；采样分布（随机 ε × 固定图集）向训练场景对齐，
+        图像集固定是为跨 ckpt 可比付出的有意取舍；
+      - 噪声流与 meta-grad 轴相互独立（各自专用种子），避免共享噪声伪造相关。
+
+    Dt 候选定义（每 t，同图同噪声同 t 配对；x0 预测，L = ‖pred−x‖²）：
+      dabs —— 绝对 loss 差 mean(L0)−mean(Lz)：原始定义，受跨 t 量纲污染
+      drel —— 相对消除率 1 − mean(Lz)/mean(L0)：尺度无关，"z_sem 贡献率"语义。
+              必须用 ratio-of-means（分子分母分别平均再相除）——逐样本比
+              (L0−Lz)/L0 在小 t 处被 L0≈0 的样本炸掉（有偏且方差发散）。
+              注：候选③"D/EMA(L0)"与本式逐点相等（(E[L0]−E[Lz])/E[L0]），不单列
+      deff —— 效应量 (mean(L0)−mean(Lz))/std(L0)：量纲与可靠性合并为一个量
+      dx0  —— gap = median‖p_z−p_c‖²：线上控制器 d_table 在 x0 模式下
+              实际使用的量，裁判实验的"现行行为"对照
+    Returns: dict —— t/logsnr/上述四键 [T]；per_image_d [T,B]（图级分析用）
     """
     unet, sampler = model.diffae_unet, model.sampler
     x, cond = batch['x_diffae'], batch['cond']
     device = x.device
     B = x.shape[0]
-    L = {k: [] for k in ('deps', 'dx0', 'prod', 'cos', 'energy')}
-
-    for t_val in sampler.use_timesteps:
-        t = torch.full((B,), t_val, device=device, dtype=torch.long)
-        noise = torch.randn_like(x)
-        x_t = sampler.q_sample(x, t, noise)
-        p_c = unet(x_t, t, cond)
-        p_z = unet(x_t, t, torch.zeros_like(cond))
-
-        ac_b = float(sampler.alphas_cumprod[t_val])
-        sq_a, sq_1a = ac_b ** 0.5, (1.0 - ac_b) ** 0.5
-
-        if getattr(sampler, 'predict_x0', False):
-            # x0 模式：输出即 x̂0；D_eps 由换算到 ε 空间得
-            s_x0 = (p_z - p_c).pow(2).flatten(1).mean(1)
-            eps_c = (x_t - sq_a * p_c) / sq_1a
-            eps_z = (x_t - sq_a * p_z) / sq_1a
-            s_eps = (eps_z - noise).pow(2).flatten(1).mean(1) - (eps_c - noise).pow(2).flatten(1).mean(1)
-        else:
-            # ε 模式：输出即 ε̂；D_x0 由换算到 x̂0 空间得
-            s_eps = (p_z - noise).pow(2).flatten(1).mean(1) - (p_c - noise).pow(2).flatten(1).mean(1)
-            x0_c = (x_t - sq_1a * p_c) / sq_a
-            x0_z = (x_t - sq_1a * p_z) / sq_a
-            s_x0 = (x0_z - x0_c).pow(2).flatten(1).mean(1)
-
-        # 参数化无关的两个比值
-        a = p_c.flatten(1)
-        b = p_z.flatten(1)
-        s_cos = 1.0 - (a * b).sum(1) / (a.norm(dim=1) * b.norm(dim=1)).clamp_min(1e-8)
-        d = b - a
-        s_energy = d.pow(2).sum(1) / a.pow(2).sum(1).clamp_min(1e-12)
-
-        L['deps'].append(s_eps.median().item())
-        L['dx0'].append(s_x0.median().item())
-        L['prod'].append((s_eps * s_x0).median().item())
-        L['cos'].append(s_cos.median().item())
-        L['energy'].append(s_energy.median().item())
-
     ts = np.array(sampler.use_timesteps)
+    T = len(ts)
+
+    # CRN：固定种子预抽一组噪声，所有 t 共用（CPU 侧生成，跨 ckpt 一致）
+    gen = torch.Generator().manual_seed(seed)
+    noises = [torch.randn(x.shape, generator=gen).to(device)
+              for _ in range(n_noise)]
+
+    L0 = np.zeros((T, n_noise, B))
+    LZ = np.zeros((T, n_noise, B))
+    GAP = np.zeros((T, n_noise, B))
+
+    for ti, t_val in enumerate(ts):
+        t = torch.full((B,), int(t_val), device=device, dtype=torch.long)
+        for j, noise in enumerate(noises):
+            x_t = sampler.q_sample(x, t, noise)
+            p_c = unet(x_t, t, cond)
+            p_z = unet(x_t, t, torch.zeros_like(cond))
+            L0[ti, j] = (p_z - x).pow(2).flatten(1).mean(1).cpu().numpy()
+            LZ[ti, j] = (p_c - x).pow(2).flatten(1).mean(1).cpu().numpy()
+            GAP[ti, j] = (p_z - p_c).pow(2).flatten(1).mean(1).cpu().numpy()
+
+    d = L0 - LZ                                    # [T, R, B]
+    l0m = L0.mean(axis=(1, 2))
+    lzm = LZ.mean(axis=(1, 2))
+    l0s = L0.reshape(T, -1).std(axis=1, ddof=1)
+    out = {
+        'dabs': d.mean(axis=(1, 2)),
+        'drel': 1.0 - lzm / np.maximum(l0m, 1e-12),
+        'deff': (l0m - lzm) / np.maximum(l0s, 1e-12),
+        'dx0': np.median(GAP.reshape(T, -1), axis=1),
+    }
     ab = sampler.alphas_cumprod.detach().cpu().numpy()
     logsnr = np.log(ab / (1.0 - ab))[ts]
-    return {'t': ts, 'logsnr': logsnr, **{k: np.array(v) for k, v in L.items()}}
+    return {'t': ts, 'logsnr': logsnr,
+            'per_image_d': d.mean(axis=1), **out}
 
 
 # =====================================================================
@@ -300,23 +309,30 @@ def measure_meta_grad_spectrum(model, batch, n_noise=8, seed=0):
             'meta': np.array(meta), 'meta_cos': np.array(meta_cos)}
 
 
-# 参与可视化的 Dt 变体（prod/energy 仍被 measure_dt_spectrum 计算，但不入图）
-DT_KEYS = ('deps', 'dx0', 'cos')
-DT_LABELS = {'deps': 'D_eps', 'dx0': 'D_x0', 'cos': 'D_cos'}
+# 参与可视化的 Dt 变体：loss 差直接 + 三个候选/对照形式（x0 预测唯一参数化）
+DT_KEYS = ('dabs', 'drel', 'deff', 'dx0')
+DT_LABELS = {'dabs': 'D_abs = mean(L0)−mean(Lz)',
+             'drel': 'D_rel = 1−mean(Lz)/mean(L0)',
+             'deff': 'D_eff = D/σ(L0)',
+             'dx0': 'D_x0 gap = median‖p_z−p_c‖²（线上口径）'}
 
 
-def dt_meta_correlation(dt, mg, keys=DT_KEYS):
+def dt_meta_correlation(dt, mg, keys=DT_KEYS, n_boot=1000, seed=0):
     """Dt 各变体与 meta-grad 的 Spearman / Pearson。
     Dt 侧按桶内平均：用在线探针注册的 bin_edges（logSNR 分位桶）把全网格
     Dt 归入 16 桶取均值——与在线 d_table 的口径一致，且消掉单点取值噪声。
-    Returns: {key: (rho_s, p_s, rho_p)}"""
+    n_boot>0 时按桶重采样（bootstrap）给 Spearman 的 95% CI——相关本身
+    的置信区间，两轴的联合噪声都被捕捉。
+    Returns: {key: (rho_s, p_s, rho_p, (ci_lo, ci_hi))}"""
     edges = mg['bin_edges']                 # [num_bins+1]，logSNR 升序
     ls = dt['logsnr']
+    K = len(edges) - 1
+    rng = np.random.default_rng(seed)
     out = {}
     for key in keys:
         bin_v = []
-        for i in range(len(edges) - 1):
-            m = (ls >= edges[i]) & (ls <= edges[i + 1]) if i == len(edges) - 2 \
+        for i in range(K):
+            m = (ls >= edges[i]) & (ls <= edges[i + 1]) if i == K - 1 \
                 else (ls >= edges[i]) & (ls < edges[i + 1])
             if m.any():
                 bin_v.append(dt[key][m].mean())
@@ -324,7 +340,18 @@ def dt_meta_correlation(dt, mg, keys=DT_KEYS):
                 bin_v.append(dt[key][int(np.argmin(np.abs(dt['t'] - mg['rep_t'][i])))])
         bin_v = np.array(bin_v)
         rho_s, p_s = spearman(bin_v, mg['meta'])
-        out[key] = (rho_s, p_s, pearson(bin_v, mg['meta']))
+        rho_p = pearson(bin_v, mg['meta'])
+        ci = (float('nan'), float('nan'))
+        if n_boot > 0 and K >= 3:
+            boots = []
+            for _ in range(n_boot):
+                idx = rng.integers(0, K, K)
+                r, _ = spearman(bin_v[idx], mg['meta'][idx])
+                if np.isfinite(r):
+                    boots.append(r)
+            if len(boots) >= 50:
+                ci = tuple(float(v) for v in np.percentile(boots, [2.5, 97.5]))
+        out[key] = (rho_s, p_s, rho_p, ci)
     return out
 
 
@@ -436,13 +463,16 @@ def measure_loss_variance(model, batch, n_t=32, n_eps_a=32, n_noise_b=8,
     Returns: dict ——
       t / logsnr: [n_t]
       arm_{a,b,c}: {l0_mean,l0_std,l0_cv, lz_mean,lz_std,lz_cv,
-                    d_mean,d_std,d_cv,d_snr} 各 [n_t]
+                    d_mean,d_std,d_cv,d_snr,
+                    gap_mean,gap_std,gap_cv,gap_snr} 各 [n_t]
+        d  = L(zero) − L(z_sem)（loss 差形式，原生参数化空间，无 eps 增益）；
+        gap = ‖p_z − p_c‖²（预测差形式，x0 模式下在线 d_table 实际喂控制器的量）。
         A/B 的 std 为组内均值的平方根（纯噪声 / 纯数据成分）；C 为全样本池化。
       arm_c 另有 corr_l0_lz [n_t]（两分支配对相关，>0.9 说明共享 x_t 主导）
       decomp: {var_a, var_b, var_c, interaction} [n_t]
         在与臂 A 相同的图像集上：var_c ≈ var_a + var_b + interaction
       raw: {Da [n_t,n_eps_a,Ba], Db [n_t,n_noise_b,N], Dc [n_t,R],
-            dc_img [R], L0c [n_t,R], Lzc [n_t,R]}（供复核/再分析）
+            dc_img [R], L0c [n_t,R], Lzc [n_t,R], Gc [n_t,R]}（供复核/再分析）
     """
     unet, sampler = model.diffae_unet, model.sampler
     device = batch['x_diffae'].device
@@ -471,8 +501,12 @@ def measure_loss_variance(model, batch, n_t=32, n_eps_a=32, n_noise_b=8,
         return torch.randn(*shape, generator=gen).to(device)
 
     def paired_losses(x, cond, t_val, noise):
-        """同一 x_t 上的配对前向。Returns: (l_c, l_z) 逐样本 [B]，网络原生参数化空间
-        （predict_x0 时目标是 x，否则是 ε）——即训练 loss 实际所在的空间。"""
+        """同一 x_t 上的配对前向。Returns: (l_c, l_z, gap) 逐样本 [B]。
+        l_c/l_z —— 网络原生参数化空间的 loss（predict_x0 时目标是 x，否则是 ε），
+            即训练 loss 实际所在的空间；D = l_z − l_c 是"loss 差"形式的 Dt。
+        gap —— ‖p_z − p_c‖²，"预测差"形式的 Dt：x0 模式下在线控制器的
+            d_table 实际喂的就是它（t_adaptive.py DtProbe.measure），
+            与 loss 差形式并存测量，两种口径的 CV/SNR 都能看。"""
         t = torch.full((x.shape[0],), int(t_val), device=device, dtype=torch.long)
         x_t = sampler.q_sample(x, t, noise)
         p_c = unet(x_t, t, cond)
@@ -480,7 +514,8 @@ def measure_loss_variance(model, batch, n_t=32, n_eps_a=32, n_noise_b=8,
         target = x if predict_x0 else noise
         l_c = (p_c - target).pow(2).flatten(1).mean(1)
         l_z = (p_z - target).pow(2).flatten(1).mean(1)
-        return l_c, l_z
+        gap = (p_z - p_c).pow(2).flatten(1).mean(1)
+        return l_c, l_z, gap
 
     if use_ema and getattr(model, '_ema_enabled', False):
         model.ema.apply_shadow()
@@ -488,50 +523,57 @@ def measure_loss_variance(model, batch, n_t=32, n_eps_a=32, n_noise_b=8,
         Da = np.zeros((len(t_list), n_eps_a, Ba))
         L0a = np.zeros_like(Da)
         Lza = np.zeros_like(Da)
+        Ga = np.zeros_like(Da)
         Db = np.zeros((len(t_list), n_noise_b, N))
         L0b = np.zeros_like(Db)
         Lzb = np.zeros_like(Db)
+        Gb = np.zeros_like(Db)
         R = n_rounds_c * N
         Dc = np.zeros((len(t_list), R))
         L0c = np.zeros_like(Dc)
         Lzc = np.zeros_like(Dc)
+        Gc = np.zeros_like(Dc)
         dc_img = np.zeros(R, dtype=np.int64)
 
         for ti, t_val in enumerate(t_list):
             # ---- 臂 A：固定 x₀ 批，仅 ε 随机 ----
             xa, ca = x_all[:Ba], cond_all[:Ba]
             for j in range(n_eps_a):
-                l_c, l_z = paired_losses(xa, ca, t_val, randn(xa.shape))
+                l_c, l_z, g = paired_losses(xa, ca, t_val, randn(xa.shape))
                 L0a[ti, j] = l_z.cpu().numpy()   # 记法统一：L0 = 零条件分支
                 Lza[ti, j] = l_c.cpu().numpy()
                 Da[ti, j] = (l_z - l_c).cpu().numpy()
+                Ga[ti, j] = g.cpu().numpy()
 
             # ---- 臂 B：固定 ε（广播），仅 x₀ 随机 ----
             for j in range(n_noise_b):
                 noise1 = randn(1, *x_all.shape[1:])
-                lzs, lcs = [], []
+                lzs, lcs, gs = [], [], []
                 for i0 in range(0, N, chunk):
                     x = x_all[i0:i0 + chunk]
-                    l_c, l_z = paired_losses(
+                    l_c, l_z, g = paired_losses(
                         x, cond_all[i0:i0 + chunk], t_val,
                         noise1.expand(x.shape[0], -1, -1, -1))
                     lcs.append(l_c.cpu().numpy())
                     lzs.append(l_z.cpu().numpy())
+                    gs.append(g.cpu().numpy())
                 L0b[ti, j] = np.concatenate(lzs)
                 Lzb[ti, j] = np.concatenate(lcs)
                 Db[ti, j] = L0b[ti, j] - Lzb[ti, j]
+                Gb[ti, j] = np.concatenate(gs)
 
             # ---- 臂 C：x₀、ε 都随机（每块每轮新噪声）----
             r = 0
             for _ in range(n_rounds_c):
                 for i0 in range(0, N, chunk):
                     x = x_all[i0:i0 + chunk]
-                    l_c, l_z = paired_losses(
+                    l_c, l_z, g = paired_losses(
                         x, cond_all[i0:i0 + chunk], t_val, randn(x.shape))
                     k = x.shape[0]
                     L0c[ti, r:r + k] = l_z.cpu().numpy()
                     Lzc[ti, r:r + k] = l_c.cpu().numpy()
                     Dc[ti, r:r + k] = L0c[ti, r:r + k] - Lzc[ti, r:r + k]
+                    Gc[ti, r:r + k] = g.cpu().numpy()
                     dc_img[r:r + k] = np.arange(i0, i0 + k)
                     r += k
     finally:
@@ -539,15 +581,17 @@ def measure_loss_variance(model, batch, n_t=32, n_eps_a=32, n_noise_b=8,
             model.ema.restore()
 
     # ---- 统计 ----
-    def arm_stats(mat0, matz, group_axis):
+    def arm_stats(mat0, matz, group_axis, matg):
         """mat: [n_t, n_rep, n_group]。A/B 取组内 std 的均方根（纯单变量成分），
-        C 传 group_axis=None 表示全池化。"""
+        C 传 group_axis=None 表示全池化。matg = gap（预测差）矩阵，同口径统计。"""
         d = mat0 - matz
         out = {k: np.zeros(len(t_list)) for k in
                ('l0_mean', 'l0_std', 'l0_cv', 'lz_mean', 'lz_std', 'lz_cv',
-                'd_mean', 'd_std', 'd_cv', 'd_snr')}
+                'd_mean', 'd_std', 'd_cv', 'd_snr',
+                'gap_mean', 'gap_std', 'gap_cv', 'gap_snr')}
         for ti in range(len(t_list)):
-            for key, m in (('l0', mat0[ti]), ('lz', matz[ti]), ('d', d[ti])):
+            for key, m in (('l0', mat0[ti]), ('lz', matz[ti]),
+                           ('d', d[ti]), ('gap', matg[ti])):
                 mean = float(m.mean())
                 if group_axis is None:
                     std = float(m.std(ddof=1)) if m.size > 1 else 0.0
@@ -558,13 +602,13 @@ def measure_loss_variance(model, batch, n_t=32, n_eps_a=32, n_noise_b=8,
                 out[f'{key}_std'][ti] = std
                 out[f'{key}_cv'][ti] = std / abs(mean) if abs(mean) > 1e-12 \
                     else float('nan')
-                if key == 'd':
-                    out['d_snr'][ti] = mean / std if std > 1e-12 else float('nan')
+                if key in ('d', 'gap'):
+                    out[f'{key}_snr'][ti] = mean / std if std > 1e-12 else float('nan')
         return out
 
-    arm_a = arm_stats(L0a, Lza, group_axis=0)   # 噪声为重复轴 -> 纯 ε 成分
-    arm_b = arm_stats(L0b, Lzb, group_axis=1)   # 图像为重复轴 -> 纯 x₀ 成分
-    arm_c = arm_stats(L0c, Lzc, group_axis=None)
+    arm_a = arm_stats(L0a, Lza, 0, Ga)          # 噪声为重复轴 -> 纯 ε 成分
+    arm_b = arm_stats(L0b, Lzb, 1, Gb)          # 图像为重复轴 -> 纯 x₀ 成分
+    arm_c = arm_stats(L0c, Lzc, None, Gc)
     # 配对相关（臂 C）：两分支共享 x_t，loss 强正相关
     corr = np.array([pearson(L0c[ti], Lzc[ti]) for ti in range(len(t_list))])
     arm_c['corr_l0_lz'] = corr
@@ -588,7 +632,7 @@ def measure_loss_variance(model, batch, n_t=32, n_eps_a=32, n_noise_b=8,
             'arm_a': arm_a, 'arm_b': arm_b, 'arm_c': arm_c,
             'decomp': decomp,
             'raw': {'Da': Da, 'Db': Db, 'Dc': Dc, 'dc_img': dc_img,
-                    'L0c': L0c, 'Lzc': Lzc}}
+                    'L0c': L0c, 'Lzc': Lzc, 'Gc': Gc}}
 
 
 def measure_grad_cos_variance(model, batch, n_t=16, n_noise=16, n_images=8,
@@ -673,6 +717,7 @@ def lossvar_verdict(res):
     return {'rho_cv_d': (rho_d, p_d), 'rho_cv_lz': (rho_lz, p_lz),
             'rho_cv_l0': (rho_l0, p_l0),
             'min_snr_high_t': float(np.nanmin(snr[hi])),
+            'min_gap_snr_high_t': float(np.nanmin(np.abs(c['gap_snr'])[hi])),
             'mean_corr_l0_lz': float(np.nanmean(c['corr_l0_lz']))}
 
 
@@ -716,9 +761,10 @@ def plot_dt_vs_meta(dt, mg=None, title='', save_path=None, keys=DT_KEYS):
             else:
                 ax.legend(fontsize=8)
             if mg is not None and col == 0:
-                rho_s, p_s, rho_p = corrs[key]
+                rho_s, p_s, rho_p, ci = corrs[key]
+                ci_s = f' CI95[{ci[0]:.2f},{ci[1]:.2f}]' if np.isfinite(ci[0]) else ''
                 ax.set_title(f'{DT_LABELS[key]} ~ meta-grad: '
-                             f'Spearman ρ={rho_s:.3f} (p={p_s:.3f}) | '
+                             f'Spearman ρ={rho_s:.3f}{ci_s} (p={p_s:.3f}) | '
                              f'Pearson r={rho_p:.3f}', fontsize=10)
     fig.suptitle(title)
     fig.tight_layout()
@@ -881,6 +927,8 @@ def plot_loss_variance(res, title='', save_path=None):
     for arm in ('arm_a', 'arm_b', 'arm_c'):
         ax.plot(t, np.abs(res[arm]['d_snr']), color=ARM_COLORS[arm], lw=2,
                 label=ARM_LABELS[arm])
+    ax.plot(t, np.abs(c['gap_snr']), color='tab:red', lw=1.5, ls=':',
+            label='SNR(gap=‖p_z−p_c‖²) [C]（在线 d_table 口径）')
     ax.axhline(1.0, color='k', ls='--', lw=1, label='|SNR|=1（信号=噪声）')
     ax.set_title('|SNR(D)| = |mean(D)|/std(D)——控制器实际吃到的信噪比', fontsize=10)
     ax.set_xlabel('t'); ax.set_ylabel('|SNR(D)|')
