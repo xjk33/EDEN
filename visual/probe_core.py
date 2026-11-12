@@ -49,15 +49,15 @@ def build_model(cfg_path, ckpt=None, device=None, cfg_overrides=None):
     init_default_scope('mmseg')
     model = MODELS.build(cfg.model)
     if ckpt is not None:
-        from mmengine.runner import load_checkpoint
+        from mmengine.runner.checkpoint import load_state_dict
         # diffae_ema_shadow 是嵌套 dict，mmengine 的键匹配不消费它（报 unexpected
         # key 且 shadow 留在随机初始化状态）——先手动灌进 EMAManager 再加载，
-        # 否则 apply_shadow 会把随机初始化权重换进 DiT（条件通路零初始化 => D≡0）
+        # 否则 apply_shadow 会把随机初始化权重换进 DiT（adaLN-Zero => 输出恒 0）
         state = torch.load(ckpt, map_location='cpu')
         sd = state.get('state_dict', state)
         if hasattr(model, 'ema') and 'diffae_ema_shadow' in sd:
             model.ema.load_state_dict(sd.pop('diffae_ema_shadow'))
-        load_checkpoint(model, state, map_location='cpu', strict=False)
+        load_state_dict(model, sd, strict=False)
     if device is None:
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
     return model.to(device).eval(), cfg
