@@ -184,16 +184,22 @@ def measure_dt_spectrum(model, batch, n_noise=8, seed=0):
         图像集固定是为跨 ckpt 可比付出的有意取舍；
       - 噪声流与 meta-grad 轴相互独立（各自专用种子），避免共享噪声伪造相关。
 
-    Dt 候选定义（每 t，同图同噪声同 t 配对；x0 预测，L = ‖pred−x‖²）：
-      dabs —— 绝对 loss 差 mean(L0)−mean(Lz)：原始定义，受跨 t 量纲污染
-      drel —— 相对消除率 1 − mean(Lz)/mean(L0)：尺度无关，"z_sem 贡献率"语义。
-              必须用 ratio-of-means（分子分母分别平均再相除）——逐样本比
-              (L0−Lz)/L0 在小 t 处被 L0≈0 的样本炸掉（有偏且方差发散）。
-              注：候选③"D/EMA(L0)"与本式逐点相等（(E[L0]−E[Lz])/E[L0]），不单列
-      deff —— 效应量 (mean(L0)−mean(Lz))/std(L0)：量纲与可靠性合并为一个量
-      dx0  —— gap = median‖p_z−p_c‖²：线上控制器 d_table 在 x0 模式下
-              实际使用的量，裁判实验的"现行行为"对照
-    Returns: dict —— t/logsnr/上述四键 [T]；per_image_d [T,B]（图级分析用）
+    Dt 定稿形式（风险调整后的相对贡献；x0 预测，L = ‖pred−x‖²，
+    每 t 有 n_noise×B 个配对样本，D = L0−Lz）：
+        u(t) = (D̄(t) − κ·σ(t)) / (L̄₀(t) + δ)
+      分子（减法）管存亡：σ 大到把 D̄ 扣穿零的 t 被压制（不可复现的贡献
+      不算数）；D̄ 与 σ 同量纲（都是 loss），减法合法。
+      分母（除法）管排序：除以无条件难度 L̄₀，存活 t 按"占无条件难度的
+      比例"排剂量，跨 t/跨任务可比；除以正数不改变符号。
+      小 t 处 D̄、σ 都→0，u 自动趋零，无需人工压制。
+      δ = 0.1 × median(L̄₀)（全 t 中位数的 1/10，纯数值保险，不承担语义）。
+    两个 σ 变体（主版 + 对照）：
+      u{κ}  —— σ = std(L0)：无条件难度的散布（主版）
+      ud{κ} —— σ = std(D)：贡献本身的散布（对照版）
+    κ ∈ {0, 0.5, 1, 2} 四档扫描；κ=0 时 u ≈ drel（退化基准）。
+    另在返回中保留 dabs/drel/deff/dx0（旧口径，不进裁判图）。
+    Returns: dict —— t/logsnr/8 个 u 键 + 4 个旧口径键 [T]；
+      per_image_d [T,B]（图级分析用）
     """
     unet, sampler = model.diffae_unet, model.sampler
     x = batch['x_diffae']
@@ -231,12 +237,21 @@ def measure_dt_spectrum(model, batch, n_noise=8, seed=0):
     l0m = L0.mean(axis=(1, 2))
     lzm = LZ.mean(axis=(1, 2))
     l0s = L0.reshape(T, -1).std(axis=1, ddof=1)
-    out = {
-        'dabs': d.mean(axis=(1, 2)),
+    dm = d.mean(axis=(1, 2))
+    ds = d.reshape(T, -1).std(axis=1, ddof=1)
+    # 定稿形式 u(t) = (D̄ − κ·σ)/(L̄₀ + δ)，δ = 0.1 × median(L̄₀)（数值保险）
+    delta = 0.1 * float(np.median(l0m))
+    out = {}
+    for k, tag in ((0.0, '0'), (0.5, '05'), (1.0, '1'), (2.0, '2')):
+        out[f'u{tag}'] = (dm - k * l0s) / (l0m + delta)   # 主版：σ = std(L0)
+        out[f'ud{tag}'] = (dm - k * ds) / (l0m + delta)   # 对照：σ = std(D)
+    # 旧口径保留（不进裁判图）
+    out.update({
+        'dabs': dm,
         'drel': 1.0 - lzm / np.maximum(l0m, 1e-12),
         'deff': (l0m - lzm) / np.maximum(l0s, 1e-12),
         'dx0': np.median(GAP.reshape(T, -1), axis=1),
-    }
+    })
     ab = sampler.alphas_cumprod.detach().cpu().numpy()
     logsnr = np.log(ab / (1.0 - ab))[ts]
     return {'t': ts, 'logsnr': logsnr,
@@ -364,12 +379,13 @@ def measure_meta_grad_spectrum(model, batch, n_t=32, n_subsets=4, n_noise=2,
             'bin_edges': probe.bin_edges.detach().cpu().numpy()}
 
 
-# 参与可视化的 Dt 变体：loss 差直接 + 三个候选/对照形式（x0 预测唯一参数化）
-DT_KEYS = ('dabs', 'drel', 'deff', 'dx0')
-DT_LABELS = {'dabs': 'D_abs = mean(L0)−mean(Lz)',
-             'drel': 'D_rel = 1−mean(Lz)/mean(L0)',
-             'deff': 'D_eff = D/σ(L0)',
-             'dx0': 'D_x0 gap = median‖p_z−p_c‖²（线上口径）'}
+# 参与可视化的 Dt 变体：定稿形式 u(t) = (D̄−κσ)/(L̄₀+δ)
+# 主版 σ=std(L0)（u 前缀）+ 对照版 σ=std(D)（ud 前缀），κ ∈ {0, 0.5, 1, 2}
+DT_KEYS = ('u0', 'u05', 'u1', 'u2', 'ud0', 'ud05', 'ud1', 'ud2')
+DT_LABELS = {'u0': 'u(κ=0, σ_L0)', 'u05': 'u(κ=0.5, σ_L0)',
+             'u1': 'u(κ=1, σ_L0)', 'u2': 'u(κ=2, σ_L0)',
+             'ud0': 'u(κ=0, σ_D)', 'ud05': 'u(κ=0.5, σ_D)',
+             'ud1': 'u(κ=1, σ_D)', 'ud2': 'u(κ=2, σ_D)'}
 
 
 def dt_meta_correlation(dt, mg, keys=DT_KEYS, n_boot=1000, seed=0):
