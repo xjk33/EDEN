@@ -449,10 +449,11 @@ def measure_loss_variance(model, batch, n_t=32, n_eps_a=32, n_noise_b=8,
     idx = np.unique(np.linspace(0, len(grid) - 1, n_t).round().astype(int))
     t_list = grid[idx]
 
-    # 全部 N 张图的 cond 按 chunk 现算（当前 ckpt 的 encoder，与训练同分布）
+    # 全部 N 张图的 cond 逐张现算（当前 ckpt 的 encoder，与训练同分布）。
+    # val 图尺寸不一（如 683/703），xis 只能逐图过 backbone，不能 cat 成批。
     cond_all = []
-    for i0 in range(0, N, chunk):
-        xi = torch.cat(batch['xis'][i0:i0 + chunk], 0).to(device)
+    for i in range(N):
+        xi = batch['xis'][i].to(device)
         cond_all.append(model.diffae_enc_compress(model.encode_diffae(xi)))
     cond_all = torch.cat(cond_all, 0)
 
