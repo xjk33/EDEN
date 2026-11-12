@@ -246,22 +246,29 @@ def measure_dt_spectrum(model, batch, n_noise=8, seed=0):
 # =====================================================================
 # 测量 2：meta-gradient 谱（Dt 价值的金标准）
 # =====================================================================
-def measure_meta_grad_spectrum(model, batch, n_noise=8, seed=0):
+def measure_meta_grad_spectrum(model, batch, n_noise=8, seed=0, t_stride=1):
     """
     一阶 meta gradient（foMAML 形式）：把 t 的采样权重 w(t) 视为外层变量，
         ∂L_task(θ - α Σ_t w_t ∇L_diff(t)) / ∂w_t  ∝  -⟨∇L_task, ∇L_diff(t)⟩
     内积越大（越同向）= 在该 t 上去噪训练对下游任务的真实增益越大。
     与 Dt 谱的相关性越高，Dt 作为"下游贡献度代理"的价值越高。
 
+    全网格版：在训练网格的每个 t（t_stride>1 时隔点）上测量，与 Dt 谱
+    同横轴、同点数——相关可直接在全部网格点上逐点计算（~100 点 vs
+    旧版 16 桶点），曲线连续、统计功效更高。代价 = len(t_grid)×n_noise
+    次 backbone 反传（100×8=800/ckpt），t_stride=2 可减半。
+
     方差控制（Dt 的差分配对天然免疫噪声实现，红线是绝对量、需人工补）：
-      - 预抽 n_noise 个噪声、全部桶共用（common random numbers）：
-        桶间比较不再含"换了噪声"的成分，每桶估计仍无偏；
-      - 每桶对 n_noise 个梯度取平均再做内积（线性等价于平均内积），
-        单桶方差 ÷ n_noise；
+      - 预抽 n_noise 个噪声、全部 t 共用（common random numbers）：
+        点间比较不再含"换了噪声"的成分，每点估计仍无偏；
+      - 每点对 n_noise 个梯度取平均再做内积（线性等价于平均内积），
+        单点方差 ÷ n_noise；
       - 噪声来自独立种子的专用生成器，与 Dt 测量的噪声无关——
         两条谱共用噪声会让波动同向、虚增相关性，独立采样是保守方向。
+    显存控制：cond 逐 t 重算，每个 t 的最后一次反传释放该 t 的计算图
+    （旧版全程 retain_graph，全网格 800 次反传会 OOM）。
 
-    Returns: dict —— rep_t / rep_logsnr / bin_edges /
+    Returns: dict —— t / logsnr（全网格）/ rep_t / rep_logsnr / bin_edges /
       meta      单位化内积 ⟨g_task, g_diff/‖g_diff‖⟩（主量，跨 t 可比）
       meta_raw  裸内积（诊断：含梯度量级随 t 增长的混杂）
       meta_cos  余弦（与 meta 跨 t 排名相同，尺度再除 ‖g_task‖）
@@ -282,30 +289,31 @@ def measure_meta_grad_spectrum(model, batch, n_noise=8, seed=0):
               for p, g in zip(params, g_task)]
     norm_task = torch.sqrt(sum((g ** 2).sum() for g in g_task)).clamp_min(1e-12)
 
-    # cond 带梯度、只算一次；各桶共享其子图，反传 retain_graph 保住它
-    cond = make_cond_fn(model, batch['xis'])()
-
-    # CRN：固定种子预抽一组噪声，所有桶共用（CPU 侧生成，与设备/全局 RNG 解耦）
+    # CRN：固定种子预抽一组噪声，所有 t 共用（CPU 侧生成，与设备/全局 RNG 解耦）
     gen = torch.Generator().manual_seed(seed)
     noises = [torch.randn(x.shape, generator=gen).to(device)
               for _ in range(n_noise)]
 
+    ts = np.array(sampler.use_timesteps, dtype=np.int64)[::t_stride]
     meta, meta_raw, meta_cos = [], [], []
-    for bi in range(probe.num_bins):
-        t_val = int(probe.bin_rep_t[bi])
-        t = torch.full((B,), t_val, device=device, dtype=torch.long)
+    for t_val in ts:
+        # cond 带梯度、逐 t 重算；同一 t 内的 n_noise 次反传共享其子图，
+        # 最后一次反传释放（retain_graph=False），显存峰值 = 单 t 的图
+        cond = make_cond_fn(model, batch['xis'])()
+        t = torch.full((B,), int(t_val), device=device, dtype=torch.long)
         g_acc = None
-        for noise in noises:
+        for j, noise in enumerate(noises):
             x_t = sampler.q_sample(x, t, noise)
             pred = unet(x_t, t, cond)
             target = x if getattr(sampler, 'predict_x0', False) else noise
             l_diff = F.mse_loss(pred, target)
             g = torch.autograd.grad(l_diff, params, allow_unused=True,
-                                    retain_graph=True)
+                                    retain_graph=(j < n_noise - 1))
             g = [torch.zeros_like(p) if gg is None else gg.detach()
                  for p, gg in zip(params, g)]
             g_acc = g if g_acc is None else [a + b for a, b in zip(g_acc, g)]
         g_diff = [a / n_noise for a in g_acc]
+        del cond
 
         ip = sum((gt * gd).sum() for gt, gd in zip(g_task, g_diff))
         norm_diff = torch.sqrt(sum((g ** 2).sum() for g in g_diff)).clamp_min(1e-12)
@@ -317,10 +325,12 @@ def measure_meta_grad_spectrum(model, batch, n_noise=8, seed=0):
         meta_raw.append(ip.item())
         meta_cos.append((ip / (norm_task * norm_diff)).item())
 
-    rep_t = probe.bin_rep_t.detach().cpu().numpy().astype(int)
     ab = sampler.alphas_cumprod.detach().cpu().numpy()
+    logsnr = np.log(ab / (1.0 - ab))[ts]
+    rep_t = probe.bin_rep_t.detach().cpu().numpy().astype(int)
     rep_logsnr = np.log(ab / (1.0 - ab))[rep_t]
-    return {'rep_t': rep_t, 'rep_logsnr': rep_logsnr,
+    return {'t': ts, 'logsnr': logsnr,
+            'rep_t': rep_t, 'rep_logsnr': rep_logsnr,
             'bin_edges': probe.bin_edges.detach().cpu().numpy(),
             'meta': np.array(meta), 'meta_raw': np.array(meta_raw),
             'meta_cos': np.array(meta_cos)}
@@ -336,34 +346,45 @@ DT_LABELS = {'dabs': 'D_abs = mean(L0)−mean(Lz)',
 
 def dt_meta_correlation(dt, mg, keys=DT_KEYS, n_boot=1000, seed=0):
     """Dt 各变体与 meta-grad 的 Spearman / Pearson。
-    Dt 侧按桶内平均：用在线探针注册的 bin_edges（logSNR 分位桶）把全网格
-    Dt 归入 16 桶取均值——与在线 d_table 的口径一致，且消掉单点取值噪声。
-    n_boot>0 时按桶重采样（bootstrap）给 Spearman 的 95% CI——相关本身
-    的置信区间，两轴的联合噪声都被捕捉。
+    meta 为全网格时（len == len(dt['t'])，现版本默认）直接在全部网格点上
+    逐点相关——点数从 16 桶点升到 ~100，统计功效显著提高；
+    旧格式（16 桶点）退回桶内平均口径（Dt 按 bin_edges 归桶取均值）。
+    n_boot>0 时按点对重采样（bootstrap）给 Spearman 的 95% CI。
     Returns: {key: (rho_s, p_s, rho_p, (ci_lo, ci_hi))}"""
-    edges = mg['bin_edges']                 # [num_bins+1]，logSNR 升序
+    rng = np.random.default_rng(seed)
+    full = len(mg['meta']) == len(dt['t'])
+    edges = mg['bin_edges']
     ls = dt['logsnr']
     K = len(edges) - 1
-    rng = np.random.default_rng(seed)
     out = {}
     for key in keys:
-        bin_v = []
-        for i in range(K):
-            m = (ls >= edges[i]) & (ls <= edges[i + 1]) if i == K - 1 \
-                else (ls >= edges[i]) & (ls < edges[i + 1])
-            if m.any():
-                bin_v.append(dt[key][m].mean())
-            else:                            # 桶内无网格点（不应发生），退回最近点
-                bin_v.append(dt[key][int(np.argmin(np.abs(dt['t'] - mg['rep_t'][i])))])
-        bin_v = np.array(bin_v)
-        rho_s, p_s = spearman(bin_v, mg['meta'])
-        rho_p = pearson(bin_v, mg['meta'])
+        if full:
+            x, y = dt[key], mg['meta']
+        else:
+            # 非同网格（旧 16 桶点格式或 t_stride>1）：两侧各自按 bin_edges
+            # 归入 K 桶取均值，空桶退回最近点，保证两边等长
+            def _binned(vals, ls_side):
+                out_v = []
+                for i in range(K):
+                    m = (ls_side >= edges[i]) & (ls_side <= edges[i + 1]) \
+                        if i == K - 1 else (ls_side >= edges[i]) & (ls_side < edges[i + 1])
+                    if m.any():
+                        out_v.append(vals[m].mean())
+                    else:
+                        out_v.append(vals[int(np.argmin(np.abs(ls_side - 0.5 * (edges[i] + edges[i + 1]))))])
+                return np.array(out_v)
+
+            x = _binned(dt[key], ls)
+            y = _binned(mg['meta'], mg.get('logsnr', mg['rep_logsnr']))
+        rho_s, p_s = spearman(x, y)
+        rho_p = pearson(x, y)
         ci = (float('nan'), float('nan'))
-        if n_boot > 0 and K >= 3:
+        n = len(x)
+        if n_boot > 0 and n >= 3:
             boots = []
             for _ in range(n_boot):
-                idx = rng.integers(0, K, K)
-                r, _ = spearman(bin_v[idx], mg['meta'][idx])
+                idx = rng.integers(0, n, n)
+                r, _ = spearman(x[idx], y[idx])
                 if np.isfinite(r):
                     boots.append(r)
             if len(boots) >= 50:
@@ -757,10 +778,15 @@ def plot_dt_vs_meta(dt, mg=None, title='', save_path=None, keys=DT_KEYS):
 
     fig, axes = plt.subplots(len(keys), 2, figsize=(13, 3.6 * len(keys)),
                              squeeze=False)
+    # meta 为全网格时按连续曲线画；旧格式（16 桶点）退回散点
+    mg_full = mg is not None and len(mg['meta']) == len(dt['t'])
+    x_mg_t = mg['t'] if (mg and 't' in mg) else (mg['rep_t'] if mg else None)
+    x_mg_ls = mg['logsnr'] if (mg and 'logsnr' in mg) \
+        else (mg['rep_logsnr'] if mg else None)
     for row, key in enumerate(keys):
         for col, (x_dt, x_mg, xlab) in enumerate([
-                (dt['t'], mg['rep_t'] if mg else None, 't'),
-                (dt['logsnr'], mg['rep_logsnr'] if mg else None, 'log SNR')]):
+                (dt['t'], x_mg_t, 't'),
+                (dt['logsnr'], x_mg_ls, 'log SNR')]):
             ax = axes[row, col]
             ax.plot(x_dt, dt[key], lw=2, color='tab:blue',
                     label=f'{DT_LABELS[key]} (Dt)')
@@ -770,8 +796,13 @@ def plot_dt_vs_meta(dt, mg=None, title='', save_path=None, keys=DT_KEYS):
             ax.grid(alpha=0.3)
             if mg is not None:
                 ax2 = ax.twinx()
-                ax2.plot(x_mg, mg['meta'], lw=2, marker='o', ms=4,
-                         color='tab:red', label='meta-grad <g_task, ĝ_diff> (unit-norm)')
+                if mg_full:
+                    ax2.plot(x_mg, mg['meta'], lw=1.8, color='tab:red',
+                             label='meta-grad <g_task, ĝ_diff> (unit-norm)')
+                else:
+                    ax2.plot(x_mg, mg['meta'], lw=2, marker='o', ms=4,
+                             color='tab:red',
+                             label='meta-grad <g_task, ĝ_diff> (unit-norm)')
                 ax2.set_ylabel('meta gradient (unit-norm)', color='tab:red')
                 lines = ax.get_lines() + ax2.get_lines()
                 ax.legend(lines, [l.get_label() for l in lines], fontsize=8)
