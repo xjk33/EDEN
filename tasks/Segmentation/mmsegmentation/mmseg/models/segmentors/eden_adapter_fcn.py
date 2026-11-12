@@ -95,9 +95,11 @@ class SplitOptimWrapperConstructor:
 def _add_monitor_keys(losses, diff_out):
     """把监控标量挂到 losses 上。键名不含 'loss'，不参与 loss 求和，只会被记录。
     tw_*: t 权重熵 / 最大桶权重；zsem_std: z_sem 跨图 std（存活判据）；ts_mean: 采样 t 均值；
-    ants_*: Beta 采样器 (a, b) 均值 / 队列平滑 reward / 采样熵。"""
+    ants_*: Beta 采样器 (a, b) 均值 / 队列平滑 reward / 采样熵；
+    khun_phase: Khungurn 两阶段当前阶段（1=纯噪声课程，2=偏低噪采样）。"""
     for k in ("tw_ent", "tw_max", "zsem_std", "ts_mean",
-              "ants_a", "ants_b", "ants_reward", "ants_ent"):
+              "ants_a", "ants_b", "ants_reward", "ants_ent",
+              "khun_phase"):
         v = diff_out.get(k)
         if v is not None:
             losses[k] = v
@@ -148,6 +150,10 @@ class FCNWithDiffAE(DiffAEMixin, EncoderDecoder):
         ants_queue: int = 20,
         ants_rep_timesteps: tuple = (200, 500, 800),
         ants_hidden: int = 256,
+        # ---- Khungurn 两阶段（透传给 DiffAEMixin，与 ants/t_weight/窗口互斥）----
+        khun_enabled: bool = False,
+        khun_phase1_iters: int = 20000,
+        khun_phase1_t: int = 990,
         # ---- t 自适应（透传给 DiffAEMixin -> TAdaptive）----
         t_weight_enabled: bool = False,
         t_weight_warmup_iters: int = 5000,
@@ -213,6 +219,9 @@ class FCNWithDiffAE(DiffAEMixin, EncoderDecoder):
             ants_queue=ants_queue,
             ants_rep_timesteps=ants_rep_timesteps,
             ants_hidden=ants_hidden,
+            khun_enabled=khun_enabled,
+            khun_phase1_iters=khun_phase1_iters,
+            khun_phase1_t=khun_phase1_t,
             t_weight_enabled=t_weight_enabled,
             t_weight_warmup_iters=t_weight_warmup_iters,
             t_weight_eta=t_weight_eta,

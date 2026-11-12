@@ -155,6 +155,10 @@ class DiffAEMixin(nn.Module):
         ants_queue: int = 20,                  # reward 队列长度 |Q|（原文 20）
         ants_rep_timesteps: Tuple[int, ...] = (200, 500, 800),  # 代表时间步集 S（简化：固定 3 点）
         ants_hidden: int = 256,
+        # ---- Khungurn 两阶段（arXiv:2504.21368，训练侧 t 课程；与 ants/t_weight/窗口互斥）----
+        khun_enabled: bool = False,
+        khun_phase1_iters: int = 20000,   # 阶段一长度（原文：总长的 1/4，未调优；80k -> 20k）
+        khun_phase1_t: int = 990,         # 阶段一恒定 t（须为网格点；ddim100 最大点 990 ≈ 原文 t=1 纯噪声）
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -273,6 +277,32 @@ class DiffAEMixin(nn.Module):
                 rep_timesteps=ants_rep_timesteps)
             self._ants_step = 0
 
+        # ---- Khungurn 两阶段：训练侧 t 课程（arXiv:2504.21368 核心机制复现）----
+        # 阶段一（前 khun_phase1_iters 步）恒 t=khun_phase1_t：输入近似纯噪声，
+        # 去噪器从输入拿不到任何信息，被迫把结构信息压进 z_sem（≈ vanilla AE 状态），
+        # 这是原文"强迫 z 携带结构信息"的机制。阶段二恢复随机采样，但密度偏低噪区
+        # （t = T_max·(1-√u)，u~U(0,1)），对应原文 Sc-4 schedule"更多时间花在
+        # 低噪区"的效果（补细节）。原文还验证了 z 的线性探针精度在两阶段下几乎不掉。
+        # 有意偏差（写入注释以备查）：为与其他臂保持单变量可比，维持 EDEN 的
+        # 线性-β schedule + x0 预测不变，不引入原文的 Sc-4 噪声 schedule 与
+        # v-prediction——只复现"两阶段课程"这一核心机制（原文 Table 1 显示
+        # x-pred 在低噪 schedule 下同样可行）。
+        self.khun_enabled = khun_enabled
+        self.khun_phase1_iters = khun_phase1_iters
+        self.khun_phase1_t = khun_phase1_t
+        if khun_enabled:
+            assert not ants_enabled, \
+                'Khungurn 与 ANTS 互斥：两者都独占 t_override 通道'
+            assert not t_weight_enabled, \
+                'Khungurn 与 t_weight 互斥：两者都决定 t 的采样分布'
+            assert custom_timestep_sampler is None, \
+                'Khungurn 与 custom_timestep_sampler 互斥（t_override 会覆盖窗口采样）'
+            assert khun_phase1_t in self.sampler.use_timesteps, \
+                f'khun_phase1_t={khun_phase1_t} 不在采样网格上（如 ddim100: 0,10,...,990）'
+            self._khun_step = 0
+            tm = self.sampler.timestep_map
+            self._khun_grid_step = tm[1] - tm[0] if len(tm) > 1 else 1
+
         # 配置镜像（adapter / 监控钩子读取用；实现细节都在子模块里）
         self.diffae_pred_x0 = diffae_pred_x0
         self.diffae_mask_ratio = diffae_mask_ratio
@@ -360,6 +390,24 @@ class DiffAEMixin(nn.Module):
                     x=x_start.detach(), cond=cond.detach(),
                     logp=logp, ent=ent, ab=ab, before=before, noises=noises)
 
+        # Khungurn 两阶段：阶段一恒 t=khun_phase1_t（纯噪声课程，逼 z_sem 扛结构）；
+        # 阶段二偏低噪密度 t = T_max·(1-√u)，吸附到采样网格后与 t_override 通道对接。
+        khun_phase = 0.0
+        if self.khun_enabled and self.training:
+            self._khun_step += 1
+            if self._khun_step <= self.khun_phase1_iters:
+                khun_phase = 1.0
+                t_override = torch.full(
+                    (x_start.shape[0],), self.khun_phase1_t,
+                    device=x_start.device, dtype=torch.long)
+            else:
+                khun_phase = 2.0
+                u = torch.rand(x_start.shape[0], device=x_start.device)
+                t_f = self.khun_phase1_t * (1.0 - u.sqrt())
+                step = self._khun_grid_step
+                t_override = (torch.round(t_f / step) * step).long().clamp_(
+                    0, self.khun_phase1_t)
+
         # 结构化加噪：MaskApplier 把蒙块翻译成 sampler 的输入（软蒙/硬蒙/无蒙）
         loss_kwargs = self.mask_applier.transform(x_start, input_mask)
         losses = self.sampler.training_losses(
@@ -392,6 +440,9 @@ class DiffAEMixin(nn.Module):
         if self.ants_enabled:
             # ANTS 监控：上一次 REINFORCE 的读数（一步延迟，键名无 'loss' 不求和）
             out.update(self._ants_monitor)
+        if self.khun_enabled:
+            # Khungurn 监控：当前所处阶段（1=纯噪声课程，2=偏低噪采样）
+            out['khun_phase'] = torch.tensor(khun_phase)
         return out
 
     # ------------------------------------------------------------------

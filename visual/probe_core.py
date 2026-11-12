@@ -7,11 +7,12 @@
   - 每个 ipynb 只做三件事：build_model / build_val_batch -> 调本文件的 measure_* -> 调 plot_*。
   - 在 mmsegmentation 环境下运行（需要 mmseg/mmengine 建模型与 dataloader）。
 
-包含四组能力：
+包含五组能力：
   1. Dt 谱 + meta-gradient 金标准（Dt 价值判据：两者相关性越高 Dt 越可信）
   2. t_weight / d_table 快照与跨 ckpt 演化（t 自适应学到了什么）
   3. 重建可视化（z_sem 复活判据）
   4. 蒙块选址可视化（结构化噪声蒙的位置与剂量）
+  5. 固定 t 的 loss 方差分解（大 t 抖动：测量噪声 vs 任务本质不稳定）
 
 注意：旧 checkpoint 的 t 自适应 buffer 键名（顶层 t_weight/d_table/...）在重构后
 变为 t_adaptive.probe.*/t_adaptive.scheduler.*，strict=False 加载即可——
@@ -377,6 +378,297 @@ def measure_mask_selection(model, batch, num_images=4):
 
 
 # =====================================================================
+# 测量 5：固定 t 的 loss 方差分解（测量噪声 vs 任务本质不稳定）
+# =====================================================================
+def _msd(v):
+    """mean / std(ddof=1) / CV / SNR。CV、SNR 在均值近零时给 nan（D 的均值可跨 0，
+    此时 CV 无意义，应以 SNR 为判据）。"""
+    v = np.asarray(v, float)
+    m = float(v.mean())
+    s = float(v.std(ddof=1)) if v.size > 1 else 0.0
+    cv = s / abs(m) if abs(m) > 1e-12 else float('nan')
+    snr = m / s if s > 1e-12 else float('nan')
+    return m, s, cv, snr
+
+
+@torch.no_grad()
+def measure_loss_variance(model, batch, n_t=32, n_eps_a=32, n_noise_b=8,
+                          n_rounds_c=8, arm_a_images=16, chunk=16,
+                          use_ema=True, seed=0):
+    """
+    固定 t、重复采样 (x₀, ε) 的 loss 分布测量——回答"大 t 处 Dt 曲线抖动是
+    测量噪声还是去噪任务本质不稳定"。
+
+    关键陷阱：loss 的绝对量级随 t 单调增长（可差一个数量级以上），因此
+    "原始方差随 t 增大"数学上必然成立、什么都证明不了。必须以相对量为判据：
+      CV  = std / |mean|   （变异系数，消除量纲；L₀/Lz 用）
+      SNR = mean / std     （D 的均值可跨 0，CV 失效，D 以 SNR 为判据）
+
+    三个变量臂（方差分解）：
+      A —— 固定同一批 x₀（前 arm_a_images 张），仅噪声 ε 随机：噪声采样贡献
+      B —— 固定同一个 ε（广播到整批），仅数据 x₀ 随机：数据多样性贡献
+      C —— x₀ 与 ε 都随机：训练时实际面对的总方差（主结果）
+    两分支配对：每次测量用同一个 x_t（同 x₀、同 ε）跑 cond / zero-cond 两次
+    前向。Var(D) = Var(L₀)+Var(Lz)−2Cov，配对保留的协方差正是 D 方差远小于
+    独立假设的主因——不可拆成两次独立采样。
+
+    模型冻结：全程 eval +（可选）EMA shadow，消除训练动态混淆；
+    cond 由当前 ckpt 的 encoder 现算（与训练同分布；不能用建数时随机
+    初始化 backbone 算出的 cond）。
+    噪声 / 分组由独立种子的专用生成器产生，跨 ckpt 完全相同（CRN），
+    保证早/中/晚三条曲线可比。
+
+    Args:
+        n_t:         t 网格取点数（在训练网格 use_timesteps 上等距取，20~50 为宜）
+        n_eps_a:     臂 A 每图的噪声重复数（≥32 组内方差才稳）
+        n_noise_b:   臂 B 的固定 ε 个数（每个 ε 扫全部 N 张图）
+        n_rounds_c:  臂 C 轮数（每轮扫全部 N 张图，每块新噪声；总样本 = 轮×N）
+        arm_a_images: 臂 A 固定的图像数 Ba
+        chunk:       前向分块大小（显存保护）
+
+    Returns: dict ——
+      t / logsnr: [n_t]
+      arm_{a,b,c}: {l0_mean,l0_std,l0_cv, lz_mean,lz_std,lz_cv,
+                    d_mean,d_std,d_cv,d_snr} 各 [n_t]
+        A/B 的 std 为组内均值的平方根（纯噪声 / 纯数据成分）；C 为全样本池化。
+      arm_c 另有 corr_l0_lz [n_t]（两分支配对相关，>0.9 说明共享 x_t 主导）
+      decomp: {var_a, var_b, var_c, interaction} [n_t]
+        在与臂 A 相同的图像集上：var_c ≈ var_a + var_b + interaction
+      raw: {Da [n_t,n_eps_a,Ba], Db [n_t,n_noise_b,N], Dc [n_t,R],
+            dc_img [R], L0c [n_t,R], Lzc [n_t,R]}（供复核/再分析）
+    """
+    unet, sampler = model.diffae_unet, model.sampler
+    device = batch['x_diffae'].device
+    x_all = batch['x_diffae']
+    N = x_all.shape[0]
+    Ba = min(arm_a_images, N)
+    predict_x0 = getattr(sampler, 'predict_x0', False)
+
+    # t 网格：训练网格上等距取 n_t 个点（值去重，保序）
+    grid = np.array(sampler.use_timesteps, dtype=np.int64)
+    idx = np.unique(np.linspace(0, len(grid) - 1, n_t).round().astype(int))
+    t_list = grid[idx]
+
+    # 全部 N 张图的 cond 按 chunk 现算（当前 ckpt 的 encoder，与训练同分布）
+    cond_all = []
+    for i0 in range(0, N, chunk):
+        xi = torch.cat(batch['xis'][i0:i0 + chunk], 0).to(device)
+        cond_all.append(model.diffae_enc_compress(model.encode_diffae(xi)))
+    cond_all = torch.cat(cond_all, 0)
+
+    # 专用 RNG（CPU 侧生成再上传，与全局/设备 RNG 解耦；跨 ckpt 完全一致）
+    gen = torch.Generator().manual_seed(seed)
+
+    def randn(*shape):
+        return torch.randn(*shape, generator=gen).to(device)
+
+    def paired_losses(x, cond, t_val, noise):
+        """同一 x_t 上的配对前向。Returns: (l_c, l_z) 逐样本 [B]，网络原生参数化空间
+        （predict_x0 时目标是 x，否则是 ε）——即训练 loss 实际所在的空间。"""
+        t = torch.full((x.shape[0],), int(t_val), device=device, dtype=torch.long)
+        x_t = sampler.q_sample(x, t, noise)
+        p_c = unet(x_t, t, cond)
+        p_z = unet(x_t, t, torch.zeros_like(cond))
+        target = x if predict_x0 else noise
+        l_c = (p_c - target).pow(2).flatten(1).mean(1)
+        l_z = (p_z - target).pow(2).flatten(1).mean(1)
+        return l_c, l_z
+
+    if use_ema and getattr(model, '_ema_enabled', False):
+        model.ema.apply_shadow()
+    try:
+        Da = np.zeros((len(t_list), n_eps_a, Ba))
+        L0a = np.zeros_like(Da)
+        Lza = np.zeros_like(Da)
+        Db = np.zeros((len(t_list), n_noise_b, N))
+        L0b = np.zeros_like(Db)
+        Lzb = np.zeros_like(Db)
+        R = n_rounds_c * N
+        Dc = np.zeros((len(t_list), R))
+        L0c = np.zeros_like(Dc)
+        Lzc = np.zeros_like(Dc)
+        dc_img = np.zeros(R, dtype=np.int64)
+
+        for ti, t_val in enumerate(t_list):
+            # ---- 臂 A：固定 x₀ 批，仅 ε 随机 ----
+            xa, ca = x_all[:Ba], cond_all[:Ba]
+            for j in range(n_eps_a):
+                l_c, l_z = paired_losses(xa, ca, t_val, randn(xa.shape))
+                L0a[ti, j] = l_z.cpu().numpy()   # 记法统一：L0 = 零条件分支
+                Lza[ti, j] = l_c.cpu().numpy()
+                Da[ti, j] = (l_z - l_c).cpu().numpy()
+
+            # ---- 臂 B：固定 ε（广播），仅 x₀ 随机 ----
+            for j in range(n_noise_b):
+                noise1 = randn(1, *x_all.shape[1:])
+                lzs, lcs = [], []
+                for i0 in range(0, N, chunk):
+                    x = x_all[i0:i0 + chunk]
+                    l_c, l_z = paired_losses(
+                        x, cond_all[i0:i0 + chunk], t_val,
+                        noise1.expand(x.shape[0], -1, -1, -1))
+                    lcs.append(l_c.cpu().numpy())
+                    lzs.append(l_z.cpu().numpy())
+                L0b[ti, j] = np.concatenate(lzs)
+                Lzb[ti, j] = np.concatenate(lcs)
+                Db[ti, j] = L0b[ti, j] - Lzb[ti, j]
+
+            # ---- 臂 C：x₀、ε 都随机（每块每轮新噪声）----
+            r = 0
+            for _ in range(n_rounds_c):
+                for i0 in range(0, N, chunk):
+                    x = x_all[i0:i0 + chunk]
+                    l_c, l_z = paired_losses(
+                        x, cond_all[i0:i0 + chunk], t_val, randn(x.shape))
+                    k = x.shape[0]
+                    L0c[ti, r:r + k] = l_z.cpu().numpy()
+                    Lzc[ti, r:r + k] = l_c.cpu().numpy()
+                    Dc[ti, r:r + k] = L0c[ti, r:r + k] - Lzc[ti, r:r + k]
+                    dc_img[r:r + k] = np.arange(i0, i0 + k)
+                    r += k
+    finally:
+        if use_ema and getattr(model, '_ema_enabled', False):
+            model.ema.restore()
+
+    # ---- 统计 ----
+    def arm_stats(mat0, matz, group_axis):
+        """mat: [n_t, n_rep, n_group]。A/B 取组内 std 的均方根（纯单变量成分），
+        C 传 group_axis=None 表示全池化。"""
+        d = mat0 - matz
+        out = {k: np.zeros(len(t_list)) for k in
+               ('l0_mean', 'l0_std', 'l0_cv', 'lz_mean', 'lz_std', 'lz_cv',
+                'd_mean', 'd_std', 'd_cv', 'd_snr')}
+        for ti in range(len(t_list)):
+            for key, m in (('l0', mat0[ti]), ('lz', matz[ti]), ('d', d[ti])):
+                mean = float(m.mean())
+                if group_axis is None:
+                    std = float(m.std(ddof=1)) if m.size > 1 else 0.0
+                else:  # 组内方差对组取平均再开根：纯单变量成分
+                    std = float(np.sqrt(m.std(axis=group_axis, ddof=1)
+                                        .mean())) if m.shape[group_axis] > 1 else 0.0
+                out[f'{key}_mean'][ti] = mean
+                out[f'{key}_std'][ti] = std
+                out[f'{key}_cv'][ti] = std / abs(mean) if abs(mean) > 1e-12 \
+                    else float('nan')
+                if key == 'd':
+                    out['d_snr'][ti] = mean / std if std > 1e-12 else float('nan')
+        return out
+
+    arm_a = arm_stats(L0a, Lza, group_axis=0)   # 噪声为重复轴 -> 纯 ε 成分
+    arm_b = arm_stats(L0b, Lzb, group_axis=1)   # 图像为重复轴 -> 纯 x₀ 成分
+    arm_c = arm_stats(L0c, Lzc, group_axis=None)
+    # 配对相关（臂 C）：两分支共享 x_t，loss 强正相关
+    corr = np.array([pearson(L0c[ti], Lzc[ti]) for ti in range(len(t_list))])
+    arm_c['corr_l0_lz'] = corr
+
+    # 方差分解（与臂 A 同一图像集：前 Ba 张）
+    same = dc_img < Ba
+    decomp = {k: np.zeros(len(t_list)) for k in
+              ('var_a', 'var_b', 'var_c', 'interaction')}
+    for ti in range(len(t_list)):
+        var_a = float(Da[ti].std(axis=0, ddof=1).mean() ** 2)
+        var_b = float(Db[ti, :, :Ba].std(axis=1, ddof=1).mean() ** 2)
+        var_c = float(Dc[ti, same].std(ddof=1) ** 2)
+        decomp['var_a'][ti] = var_a
+        decomp['var_b'][ti] = var_b
+        decomp['var_c'][ti] = var_c
+        decomp['interaction'][ti] = var_c - var_a - var_b
+
+    ab = sampler.alphas_cumprod.detach().cpu().numpy()
+    logsnr = np.log(ab / (1.0 - ab))[t_list]
+    return {'t': t_list, 'logsnr': logsnr,
+            'arm_a': arm_a, 'arm_b': arm_b, 'arm_c': arm_c,
+            'decomp': decomp,
+            'raw': {'Da': Da, 'Db': Db, 'Dc': Dc, 'dc_img': dc_img,
+                    'L0c': L0c, 'Lzc': Lzc}}
+
+
+def measure_grad_cos_variance(model, batch, n_t=16, n_noise=16, n_images=8,
+                              seed=0):
+    """
+    可选第四臂：固定 t 下 cos<g_task, g_diff(t)> 的方差——与 meta-grad 红线
+    的抖动直接对应。g_task 一次反传固定；g_diff(t) 对每个噪声实现独立反传，
+    逐个实现算 cos 再统计分布（不是平均梯度后再 cos——那会把方差平均掉）。
+
+    代价 = n_t × n_noise 次 backbone 反传，建议小网格（16×16）起步。
+    Returns: dict —— t / logsnr / cos_mean / cos_std / cos_cv / cos_all [n_t,n_noise]
+    """
+    sampler, unet = model.sampler, model.diffae_unet
+    device = batch['x_diffae'].device
+    x = batch['x_diffae'][:n_images]
+    xis, dsis = batch['xis'][:n_images], batch['dsis'][:n_images]
+    predict_x0 = getattr(sampler, 'predict_x0', False)
+
+    grid = np.array(sampler.use_timesteps, dtype=np.int64)
+    idx = np.unique(np.linspace(0, len(grid) - 1, n_t).round().astype(int))
+    t_list = grid[idx]
+
+    params = [p for n_, p in model.named_parameters()
+              if p.requires_grad and ('backbone' in n_ or 'diffae_enc_compress' in n_)]
+
+    # g_task：一次反传，固定
+    task_loss = make_task_loss_fn(model, xis, dsis)()
+    g_task = torch.autograd.grad(task_loss, params, allow_unused=True)
+    g_task = [torch.zeros_like(p) if g is None else g.detach()
+              for p, g in zip(params, g_task)]
+    norm_task = torch.sqrt(sum((g ** 2).sum() for g in g_task)).clamp_min(1e-12)
+
+    gen = torch.Generator().manual_seed(seed)
+    cos_all = np.zeros((len(t_list), n_noise))
+    for ti, t_val in enumerate(t_list):
+        # cond 带梯度、每 t 算一次；同 t 的 n_noise 次反传共享其子图
+        cond = make_cond_fn(model, xis)()
+        t = torch.full((x.shape[0],), int(t_val), device=device, dtype=torch.long)
+        for j in range(n_noise):
+            noise = torch.randn(x.shape, generator=gen).to(device)
+            x_t = sampler.q_sample(x, t, noise)
+            pred = unet(x_t, t, cond)
+            target = x if predict_x0 else noise
+            l_diff = F.mse_loss(pred, target)
+            g = torch.autograd.grad(l_diff, params, allow_unused=True,
+                                    retain_graph=True)
+            g = [torch.zeros_like(p) if gg is None else gg.detach()
+                 for p, gg in zip(params, g)]
+            ip = sum((gt * gd).sum() for gt, gd in zip(g_task, g))
+            norm_d = torch.sqrt(sum((gg ** 2).sum() for gg in g)).clamp_min(1e-12)
+            cos_all[ti, j] = (ip / (norm_task * norm_d)).item()
+        del cond
+        torch.cuda.empty_cache()
+
+    cos_mean = cos_all.mean(1)
+    cos_std = cos_all.std(1, ddof=1)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        cos_cv = np.where(np.abs(cos_mean) > 1e-12,
+                          cos_std / np.abs(cos_mean), np.nan)
+    ab = sampler.alphas_cumprod.detach().cpu().numpy()
+    logsnr = np.log(ab / (1.0 - ab))[t_list]
+    return {'t': t_list, 'logsnr': logsnr, 'cos_mean': cos_mean,
+            'cos_std': cos_std, 'cos_cv': cos_cv, 'cos_all': cos_all}
+
+
+def lossvar_verdict(res):
+    """按判定标准汇总读数（臂 C 为主）：
+      rho_cv_* : CV 与 t 的 Spearman 相关——不显著 ≠ 平，但显著 >0 才是"随 t 上升"
+      min_snr_high_t: 大 t 半区 |SNR(D)| 最小值——< 1 视为该处信号被噪声淹没
+    判定映射：
+      CV 随 t 基本平          -> 抖动是量纲效应，控制器不用改，平滑即可
+      CV 升但 SNR 不崩        -> 测量端加 EMA/多采样即可
+      CV 升且大 t SNR 崩溃    -> "粒度过大"假说成立，SNR(t) 可直接标定 κ·σ_t
+    """
+    t = res['t']
+    c = res['arm_c']
+    hi = t >= np.median(t)
+    snr = np.abs(c['d_snr'])
+    rho_d, p_d = spearman(t, c['d_cv'])
+    rho_lz, p_lz = spearman(t, c['lz_cv'])
+    rho_l0, p_l0 = spearman(t, c['l0_cv'])
+    return {'rho_cv_d': (rho_d, p_d), 'rho_cv_lz': (rho_lz, p_lz),
+            'rho_cv_l0': (rho_l0, p_l0),
+            'min_snr_high_t': float(np.nanmin(snr[hi])),
+            'mean_corr_l0_lz': float(np.nanmean(c['corr_l0_lz']))}
+
+
+# =====================================================================
 # 绘图
 # =====================================================================
 def _plt():
@@ -517,3 +809,146 @@ def save_recon(model, batch, save_path, max_samples=4):
         batch['x_diffae'], save_path,
         max_samples=max_samples, cond=batch['cond'])
     return save_path
+
+
+ARM_LABELS = {'arm_a': 'A: 仅 ε 随机', 'arm_b': 'B: 仅 x₀ 随机',
+              'arm_c': 'C: 皆随机(总)'}
+ARM_COLORS = {'arm_a': 'tab:orange', 'arm_b': 'tab:green', 'arm_c': 'tab:blue'}
+
+
+def plot_loss_variance(res, title='', save_path=None):
+    """loss 方差分解六联图（x 轴统一为 t，顶行小字标 logSNR）：
+      (0,0) loss 量级陷阱：mean L0/Lz 对数轴——原始方差随 t 必增，不能作判据
+      (0,1) CV(L0)、CV(Lz)，臂 C 实线 + A/B 虚线（单变量成分对照）
+      (0,2) CV(D) 三臂（D 均值跨 0 时 CV 发散，仅作参考，判据看 SNR）
+      (1,0) SNR(D) 三臂 + |SNR|=1 参考线（主判据）
+      (1,1) Var(D) 方差分解：var_a(ε) + var_b(x₀) + 交互 ≈ var_c
+      (1,2) 臂 C 两分支配对相关 corr(L0,Lz)——共享 x_t 使 D 方差远小于独立假设
+    """
+    plt = _plt()
+    t = res['t']
+    logsnr = res['logsnr']
+    a, b, c, dec = res['arm_a'], res['arm_b'], res['arm_c'], res['decomp']
+
+    fig, axes = plt.subplots(2, 3, figsize=(18, 8.5))
+
+    def _logsnr_top(ax):
+        ax2 = ax.twiny()
+        ax2.set_xlim(ax.get_xlim())
+        ticks = np.linspace(0, len(t) - 1, 6).round().astype(int)
+        ax2.set_xticks(t[ticks])
+        ax2.set_xticklabels([f'{logsnr[i]:.1f}' for i in ticks], fontsize=8)
+        ax2.set_xlabel('log SNR', fontsize=8)
+
+    # (0,0) 量级陷阱
+    ax = axes[0, 0]
+    ax.plot(t, c['l0_mean'], color='tab:gray', lw=2, label='mean L(zero)')
+    ax.plot(t, c['lz_mean'], color='tab:blue', lw=2, label='mean L(z_sem)')
+    ax.set_yscale('log')
+    ax.set_title('loss 量级随 t 增长 ⇒ 原始方差必增（无效判据）', fontsize=10)
+    ax.set_xlabel('t'); ax.set_ylabel('loss (log)')
+    ax.grid(alpha=0.3); ax.legend(fontsize=8)
+
+    # (0,1) CV(L)
+    ax = axes[0, 1]
+    ax.plot(t, c['l0_cv'], color='tab:gray', lw=2, label='CV L(zero) [C]')
+    ax.plot(t, c['lz_cv'], color='tab:blue', lw=2, label='CV L(z_sem) [C]')
+    ax.plot(t, a['lz_cv'], color='tab:orange', lw=1.2, ls='--', label='CV Lz [A:仅ε]')
+    ax.plot(t, b['lz_cv'], color='tab:green', lw=1.2, ls='--', label='CV Lz [B:仅x₀]')
+    ax.set_title('CV(loss) = std/|mean|（消除量纲后的真判据）', fontsize=10)
+    ax.set_xlabel('t'); ax.set_ylabel('CV')
+    ax.grid(alpha=0.3); ax.legend(fontsize=8)
+
+    # (0,2) CV(D) 三臂
+    ax = axes[0, 2]
+    for arm in ('arm_a', 'arm_b', 'arm_c'):
+        ax.plot(t, res[arm]['d_cv'], color=ARM_COLORS[arm], lw=2,
+                label=ARM_LABELS[arm])
+    ax.set_title('CV(D)（D 均值跨 0 处发散，仅参考）', fontsize=10)
+    ax.set_xlabel('t'); ax.set_ylabel('CV(D)')
+    ax.grid(alpha=0.3); ax.legend(fontsize=8)
+
+    # (1,0) SNR(D) 三臂——主判据
+    ax = axes[1, 0]
+    for arm in ('arm_a', 'arm_b', 'arm_c'):
+        ax.plot(t, np.abs(res[arm]['d_snr']), color=ARM_COLORS[arm], lw=2,
+                label=ARM_LABELS[arm])
+    ax.axhline(1.0, color='k', ls='--', lw=1, label='|SNR|=1（信号=噪声）')
+    ax.set_title('|SNR(D)| = |mean(D)|/std(D)——控制器实际吃到的信噪比', fontsize=10)
+    ax.set_xlabel('t'); ax.set_ylabel('|SNR(D)|')
+    ax.set_yscale('log')
+    ax.grid(alpha=0.3); ax.legend(fontsize=8)
+
+    # (1,1) 方差分解（与臂 A 同一图像集）
+    ax = axes[1, 1]
+    ax.plot(t, dec['var_c'], color='tab:blue', lw=2, label='Var(D) 总 [C]')
+    ax.plot(t, dec['var_a'], color='tab:orange', lw=2, label='Var_ε [A]')
+    ax.plot(t, dec['var_b'], color='tab:green', lw=2, label='Var_x0 [B]')
+    ax.plot(t, dec['interaction'], color='tab:red', lw=1.5, ls='--',
+            label='交互 (C−A−B)')
+    ax.set_title('Var(D) 分解：var_c ≈ var_a + var_b + 交互', fontsize=10)
+    ax.set_xlabel('t'); ax.set_ylabel('Var(D)')
+    ax.grid(alpha=0.3); ax.legend(fontsize=8)
+
+    # (1,2) 配对相关
+    ax = axes[1, 2]
+    ax.plot(t, c['corr_l0_lz'], color='tab:purple', lw=2)
+    ax.set_ylim(0, 1.02)
+    ax.set_title('corr(L0, Lz)：共享 x_t 的配对相关（Cov 是 D 方差小的主因）',
+                 fontsize=10)
+    ax.set_xlabel('t'); ax.set_ylabel('Pearson r')
+    ax.grid(alpha=0.3)
+
+    for ax in axes.flat:
+        _logsnr_top(ax)
+    fig.suptitle(title)
+    fig.tight_layout()
+    if save_path:
+        fig.savefig(save_path, dpi=150)
+    return fig
+
+
+def plot_loss_variance_evolution(results, labels, save_path=None):
+    """跨 ckpt 演化：臂 C 的 CV(D) / |SNR(D)| 曲线叠加（早/中/晚）。
+    方差结构是否随训练演化——早期若 SNR 普遍 <1，预热期不收信号的设计即被证实。"""
+    plt = _plt()
+    fig, axes = plt.subplots(1, 2, figsize=(13, 4.2))
+    for res, lab in zip(results, labels):
+        t, c = res['t'], res['arm_c']
+        axes[0].plot(t, c['d_cv'], lw=2, marker='o', ms=3, label=lab)
+        axes[1].plot(t, np.abs(c['d_snr']), lw=2, marker='o', ms=3, label=lab)
+    axes[0].set_title('CV(D) across checkpoints [arm C]')
+    axes[0].set_xlabel('t'); axes[0].set_ylabel('CV(D)'); axes[0].grid(alpha=0.3)
+    axes[1].axhline(1.0, color='k', ls='--', lw=1)
+    axes[1].set_yscale('log')
+    axes[1].set_title('|SNR(D)| across checkpoints [arm C]')
+    axes[1].set_xlabel('t'); axes[1].set_ylabel('|SNR(D)|'); axes[1].grid(alpha=0.3)
+    for ax in axes:
+        ax.legend(fontsize=8)
+    fig.tight_layout()
+    if save_path:
+        fig.savefig(save_path, dpi=150)
+    return fig
+
+
+def plot_grad_cos_variance(gres, title='', save_path=None):
+    """可选第四臂：cos<g_task, g_diff(t)> 的逐实现分布（mean ± std 带 + 散点）。"""
+    plt = _plt()
+    t = gres['t']
+    m, s = gres['cos_mean'], gres['cos_std']
+    fig, ax = plt.subplots(figsize=(7.5, 4.2))
+    ax.plot(t, m, lw=2, color='tab:red', label='mean cos')
+    ax.fill_between(t, m - s, m + s, color='tab:red', alpha=0.25,
+                    label='±1 std')
+    rng = np.random.default_rng(0)
+    for ti in range(len(t)):
+        ax.scatter(np.full(gres['cos_all'].shape[1], t[ti]) + rng.uniform(-6, 6, gres['cos_all'].shape[1]),
+                   gres['cos_all'][ti], s=6, color='tab:gray', alpha=0.5)
+    ax.axhline(0, color='k', ls='--', lw=0.8)
+    ax.set_xlabel('t'); ax.set_ylabel('cos<g_task, g_diff>')
+    ax.set_title(title or '固定 t 下梯度方向一致性 cos 的分布')
+    ax.grid(alpha=0.3); ax.legend(fontsize=8)
+    fig.tight_layout()
+    if save_path:
+        fig.savefig(save_path, dpi=150)
+    return fig
