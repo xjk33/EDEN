@@ -175,6 +175,8 @@ def pearson(x, y):
 def measure_dt_spectrum(model, batch, n_noise=8, seed=0):
     """
     Dt 谱。可靠性设计（目标：估计噪声不再污染曲线形状与跨 ckpt 比较）：
+      - cond 由当前 ckpt 的 encoder 现算（训练同分布；batch['cond'] 是建数时
+        随机初始化 backbone 的特征，Dt 必须测"当前模型的 z_sem 贡献"）；
       - 预抽 n_noise 个噪声（专用种子生成器），全部 t 共用（CRN）：
         逐 t 抖动不再含"换了噪声"的成分；跨 ckpt 用同组噪声，严格可比；
       - 每 t 有效样本 = n_noise × B（默认 8×16=128），均值类估计噪声
@@ -194,11 +196,17 @@ def measure_dt_spectrum(model, batch, n_noise=8, seed=0):
     Returns: dict —— t/logsnr/上述四键 [T]；per_image_d [T,B]（图级分析用）
     """
     unet, sampler = model.diffae_unet, model.sampler
-    x, cond = batch['x_diffae'], batch['cond']
+    x = batch['x_diffae']
     device = x.device
     B = x.shape[0]
     ts = np.array(sampler.use_timesteps)
     T = len(ts)
+
+    # cond 必须由当前 ckpt 的 encoder 现算（训练同分布的 z_sem）：
+    # batch['cond'] 是建数时无 ckpt 模型算的随机初始化特征——Dt 测的是
+    # "当前模型的 z_sem 贡献"，用随机特征会让每个 ckpt 都在回答漂移的错误问题
+    cond = torch.cat([model.diffae_enc_compress(model.encode_diffae(batch['xis'][i]))
+                      for i in range(B)], 0)
 
     # CRN：固定种子预抽一组噪声，所有 t 共用（CPU 侧生成，跨 ckpt 一致）
     gen = torch.Generator().manual_seed(seed)
