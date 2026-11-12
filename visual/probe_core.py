@@ -284,11 +284,24 @@ def measure_meta_grad_spectrum(model, batch, n_t=32, n_subsets=4, n_noise=2,
     params = [p for n_, p in model.named_parameters()
               if p.requires_grad and ('backbone' in n_ or 'diffae_enc_compress' in n_)]
 
-    # g_task：全图像池一次反传（参考系不再依赖少数图）
-    task_loss = make_task_loss_fn(model, batch['xis'], batch['dsis'])()
-    g_task = torch.autograd.grad(task_loss, params, allow_unused=True)
-    g_task = [torch.zeros_like(p) if g is None else g.detach()
-              for p, g in zip(params, g_task)]
+    # g_task：全图像池【分块】反传、累加梯度（参考系不再依赖少数图）。
+    # 不能一次建全图计算图：64 张全分辨率图的图堆起来 ~38GB 直接 OOM；
+    # 图梯度均值 = 分块梯度均值的样本数加权，数学上等价，显存峰值 = 单块的图
+    g_task = None
+    GC = 8                      # 每块图像数（单块全分辨率计算图 ~5GB）
+    n_img = len(batch['xis'])
+    for i0 in range(0, n_img, GC):
+        i1 = min(i0 + GC, n_img)
+        l_chunk = make_task_loss_fn(model, batch['xis'][i0:i1],
+                                    batch['dsis'][i0:i1])()
+        g = torch.autograd.grad(l_chunk, params, allow_unused=True)
+        g = [torch.zeros_like(p) if gg is None else gg.detach()
+             for p, gg in zip(params, g)]
+        w = (i1 - i0) / n_img
+        g_task = [w * gg for gg in g] if g_task is None else \
+                 [a + w * gg for a, gg in zip(g_task, g)]
+        del l_chunk, g
+    torch.cuda.empty_cache()
     norm_task = torch.sqrt(sum((g ** 2).sum() for g in g_task)).clamp_min(1e-12)
 
     # 固定子集划分（全部 t 共用——CRN 作用：点间差异不含子集构成差异）
