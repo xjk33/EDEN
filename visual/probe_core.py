@@ -497,6 +497,9 @@ def read_tweight_snapshot(model):
 # =====================================================================
 # 测量 4：mask-meta（空间版 ut×meta-grad：G 与分块一阶内积的相关性裁判）
 # =====================================================================
+MASK_META_VERSION = 2      # 双掩码（G 场 + IP 场）共享噪声采样版；notebook 断言用
+
+
 def _gumbel_topk(logits, k, u):
     """共享均匀噪声的 Gumbel-top-k：logits + Gumbel(u) 取前 k 个为"被蒙"，
     等价于按 softmax(logits) 无放回定量采样（log-softmax 的归一化常数不
