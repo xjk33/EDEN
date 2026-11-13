@@ -497,6 +497,23 @@ def read_tweight_snapshot(model):
 # =====================================================================
 # 测量 4：mask-meta（空间版 ut×meta-grad：G 与分块一阶内积的相关性裁判）
 # =====================================================================
+def _gumbel_topk(logits, k, u):
+    """共享均匀噪声的 Gumbel-top-k：logits + Gumbel(u) 取前 k 个为"被蒙"，
+    等价于按 softmax(logits) 无放回定量采样（log-softmax 的归一化常数不
+    影响排序，故直接对原值加噪）。与 MaskSelector.select 引导期同逻辑，
+    仅噪声由外部注入——两个概率场吃同一组 u 时采样随机性被配对消去（CRN），
+    蒙区差异只反映概率场本身的差异。
+    logits [B,n] 任意实数，u [B,n]∈(0,1)；返回 keep [B,n]（1=保留）。"""
+    n = logits.shape[1]
+    u = u.clamp(1e-12, 1.0 - 1e-12)
+    score = logits - torch.log(-torch.log(u))
+    order = score.argsort(dim=1, descending=True)
+    rank = torch.empty_like(order)
+    rank.scatter_(1, order, torch.arange(n, device=logits.device)
+                  .unsqueeze(0).expand_as(order))
+    return (rank >= k).float()                    # 前 k 个被蒙 -> keep=0
+
+
 def measure_mask_meta(model, batch, n_t=8, n_noise=2, mask_ratio=None, seed=0):
     """
     空间版"ut × meta-grad"裁判——回答"G 作为掩码选址代理有没有价值"。
@@ -514,14 +531,16 @@ def measure_mask_meta(model, batch, n_t=8, n_noise=2, mask_ratio=None, seed=0):
       - t 取训练网格等距 n_t 点 × n_noise 个 CRN 噪声（专用种子生成器，
         按 (image, t, j) 固定顺序取数——跨 ckpt 同图同噪声同 t，严格可比）；
       - IP 对 (t, ε) 取均值；逐图相关性 + 跨图均值/方差（画汇总带）；
-      - 掩码用模型自己的 mask_selector 现采（guided=True，与训练引导期同逻辑）；
-        mask_ratio=None 时用模型配置的 ratio——但旧 run 配置里 ratio=0（旧版
-        表"关闭"）或未启用掩码时，回退 0.25 作展示默认；
+      - 双掩码现采：G 场与 IP 场各自逐图 softmax，吃【同一组】Gumbel 噪声做
+        top-k（与 MaskSelector 引导期同逻辑，噪声共享 => 采样随机性配对消去，
+        蒙区差异只反映概率场差异）；mask_ratio=None 时用模型配置的 ratio——
+        旧 run 配置里 ratio=0（旧版表"关闭"）或未启用掩码时，回退 0.25；
       - G 与 IP 共享 g_task 是断言本身决定的（"G 大的块 IP 也大"），非数据泄漏。
 
     Returns: dict ——
-      img [N,3,S,S] (0~1) / g_block [N,g,g] / ip_block [N,g,g]（原始，含负值）/
-      mask [N,g,g]（0/1，块级）/ rho_s / rho_p [N]（逐图相关）/
+      img [N,3,S,S] (0~1) / g_block [N,1,g,g] / ip_block [N,1,g,g]（原始，含负值）/
+      mask / mask_ip [N,1,g,g]（keep-mask，G 场 / IP 场所采，1=保留 0=被蒙）/
+      rho_s / rho_p / iou [N]（逐图相关 + 两掩码蒙区的块级 IoU）/
       t / logsnr（IP 测量用的 t 网格）
     """
     device = batch['x_diffae'].device
@@ -541,9 +560,10 @@ def measure_mask_meta(model, batch, n_t=8, n_noise=2, mask_ratio=None, seed=0):
 
     # CRN：专用种子生成器，按 (image, t, j) 固定顺序取数 -> 跨 ckpt 同组噪声
     gen = torch.Generator().manual_seed(seed)
+    gen_mask = torch.Generator().manual_seed(seed + 7919)   # 掩码采样专用
 
-    imgs, g_blocks, ip_blocks, masks = [], [], [], []
-    rho_s, rho_p = [], []
+    imgs, g_blocks, ip_blocks, masks, masks_ip = [], [], [], [], []
+    rho_s, rho_p, ious = [], [], []
     for xi, dsi in zip(xis, dsis):
         xg = xi.detach().requires_grad_(True)
         with torch.enable_grad():
@@ -581,27 +601,35 @@ def measure_mask_meta(model, batch, n_t=8, n_noise=2, mask_ratio=None, seed=0):
         rho_s.append(r_s)
         rho_p.append(r_p)
 
-        # ---- 掩码现采（训练引导期同逻辑；输入为 128×128 热力，与训练一致）----
+        # ---- 双掩码现采：G 场与 IP 场各自 softmax，共享 Gumbel 噪声 top-k ----
         sel = model.mask_selector
         ratio = mask_ratio if mask_ratio is not None else (
             sel.ratio if (sel.enabled and sel.ratio > 0) else 0.25)
+        k_blk = max(1, int(round(ratio * g * g)))
         with torch.no_grad():
-            heat128 = F.adaptive_avg_pool2d(g_task.abs().mean(dim=1, keepdim=True), S)
-            keep = sel.select(heat128, guided=True, ratio=ratio)
-            mask_blk = F.adaptive_avg_pool2d(keep, (g, g))
+            p_g = g_blk.reshape(1, -1)
+            p_ip = ip_blk.clamp_min(0).reshape(1, -1)   # 负贡献不参与选址
+            u = torch.rand(1, g * g, generator=gen_mask).to(device)  # 共享噪声
+            keep_g = _gumbel_topk(p_g, k_blk, u).view(1, 1, g, g)
+            keep_ip = _gumbel_topk(p_ip, k_blk, u).view(1, 1, g, g)
+            mg, mi = 1.0 - keep_g, 1.0 - keep_ip        # 1=被蒙
+            union = (mg + mi - mg * mi).sum().clamp_min(1e-12)
+            ious.append(float((mg * mi).sum() / union))
             img01 = ((xi.detach() * std + mean) / 255.0).clamp(0, 1)
             imgs.append(F.interpolate(img01, size=(S, S), mode='bilinear',
                                       align_corners=False))
         g_blocks.append(g_blk.detach())
         ip_blocks.append(ip_blk.detach())
-        masks.append(mask_blk.detach())
+        masks.append(keep_g)
+        masks_ip.append(keep_ip)
 
     ab = model.sampler.alphas_cumprod.detach().cpu().numpy()
     logsnr = np.log(ab / (1.0 - ab))[t_list]
     return {'img': torch.cat(imgs, 0), 'g_block': torch.cat(g_blocks, 0),
             'ip_block': torch.cat(ip_blocks, 0), 'mask': torch.cat(masks, 0),
+            'mask_ip': torch.cat(masks_ip, 0),
             'rho_s': np.array(rho_s), 'rho_p': np.array(rho_p),
-            't': t_list, 'logsnr': logsnr}
+            'iou': np.array(ious), 't': t_list, 'logsnr': logsnr}
 
 
 # =====================================================================
@@ -1143,24 +1171,43 @@ def plot_tweight_evolution(snaps, labels, save_path=None):
     return fig
 
 
-def plot_mask_meta(res, title='', save_path=None, max_images=None):
-    """mask-meta 四联图：原图 | 分块一阶内积 IP（正部热力）| 代理 G 热力 | 掩码 m。
-    每行 G 面板标注该图 64 块的 Spearman ρ / Pearson r。
-    max_images：只画前几张（统计用全部测量图，展示裁剪）。"""
+def plot_mask_meta(res, title='', save_path=None, max_images=None, mask_alpha=1.0):
+    """mask-meta 五联图：原图 | IP 正部热力 | G 热力 | IP 掩码软叠加 | G 掩码软叠加。
+
+    软叠加 = 模型实际看到的退化输入 x̃₀ = w⊙x₀+(1−w)⊙c，w = 1−α(1−m)，
+    c 为该图均值色（与 MaskApplier 同公式），α 由 mask_alpha 控制（0=不蒙，
+    1=完全替换为均值色）；掩码块级最近邻上采样到原图分辨率。
+    两个掩码由 IP 场 / G 场经共享噪声的 Gumbel-top-k 采出，G 面板标逐图
+    Spearman ρ / Pearson r，G 叠加面板标两掩码蒙区的块级 IoU（选址共性）。
+    max_images：只画前几张（统计用全部测量图，展示裁剪）。
+    旧缓存缺 mask_ip 时退化为四联图（只画 G 掩码叠加）。"""
     plt = _plt()
     img = res['img']
     ip = res['ip_block'].cpu().numpy()
     gb = res['g_block'].cpu().numpy()
-    mk = res['mask'].cpu().numpy()
+    mk = res['mask'].cpu().numpy()                       # G 场 keep-mask [N,1,g,g]
+    mk_ip = res['mask_ip'].cpu().numpy() if 'mask_ip' in res else None
     n = img.shape[0] if max_images is None else min(max_images, img.shape[0])
+    n_col = 5 if mk_ip is not None else 4
+    S = img.shape[-1]
+    g = mk.shape[-1]
+    rep = max(1, S // g)
 
-    fig, axes = plt.subplots(n, 4, figsize=(13.5, 3.4 * n))
+    def _soft_overlay(im0, keep):
+        """x̃₀ = w⊙im + (1−w)⊙c，w = 1−α(1−m)，c = 该图均值色（MaskApplier 同式）"""
+        m = keep.repeat(rep, 0).repeat(rep, 1)           # 块级最近邻上采样
+        w = 1.0 - mask_alpha * (1.0 - m)
+        c = im0.reshape(-1, 3).mean(axis=0)
+        return np.clip(w[..., None] * im0 + (1.0 - w)[..., None] * c, 0, 1)
+
+    fig, axes = plt.subplots(n, n_col, figsize=(3.3 * n_col, 3.4 * n))
     if n == 1:
         axes = axes[None, :]
     for i in range(n):
-        ip_pos = np.clip(ip[i, 0], 0, None)              # 正部：只有正贡献参与选址
-        axes[i, 0].imshow(img[i].permute(1, 2, 0).cpu().numpy())
+        im0 = img[i].permute(1, 2, 0).cpu().numpy()
+        axes[i, 0].imshow(im0)
         axes[i, 0].set_title('image', fontsize=10)
+        ip_pos = np.clip(ip[i, 0], 0, None)              # 正部：只有正贡献参与选址
         im1 = axes[i, 1].imshow(ip_pos, cmap='turbo')
         axes[i, 1].set_title('meta IP ⟨g_task, g_den⟩ (pos)', fontsize=10)
         fig.colorbar(im1, ax=axes[i, 1], fraction=0.046)
@@ -1169,11 +1216,24 @@ def plot_mask_meta(res, title='', save_path=None, max_images=None):
             f'proxy G = |g_task| (ρ_s={res["rho_s"][i]:.2f}, '
             f'r_p={res["rho_p"][i]:.2f})', fontsize=10)
         fig.colorbar(im2, ax=axes[i, 2], fraction=0.046)
-        axes[i, 3].imshow(mk[i, 0], cmap='gray', vmin=0, vmax=1,
-                          interpolation='nearest')
-        axes[i, 3].set_title(f'mask m (masked={1 - mk[i, 0].mean():.2f})',
-                             fontsize=10)
-        for j in range(4):
+
+        col = 3
+        if mk_ip is not None:
+            axes[i, 3].imshow(_soft_overlay(im0, mk_ip[i, 0]))
+            axes[i, 3].set_title(f'IP-mask x̃₀ (α={mask_alpha:g}, '
+                                 f'masked={1 - mk_ip[i, 0].mean():.2f})',
+                                 fontsize=10)
+            col = 4
+            a, b = 1.0 - mk[i, 0], 1.0 - mk_ip[i, 0]     # 蒙区 IoU
+            union = np.clip((a + b - a * b).sum(), 1e-12, None)
+            iou = float((a * b).sum() / union)
+            g_title = f'G-mask x̃₀ (α={mask_alpha:g}, IoU={iou:.2f})'
+        else:
+            g_title = (f'G-mask x̃₀ (α={mask_alpha:g}, '
+                       f'masked={1 - mk[i, 0].mean():.2f})')
+        axes[i, col].imshow(_soft_overlay(im0, mk[i, 0]))
+        axes[i, col].set_title(g_title, fontsize=10)
+        for j in range(n_col):
             axes[i, j].axis('off')
     fig.suptitle(title)
     fig.tight_layout()
