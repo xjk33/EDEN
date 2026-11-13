@@ -497,7 +497,7 @@ def read_tweight_snapshot(model):
 # =====================================================================
 # 测量 4：mask-meta（空间版 ut×meta-grad：G 与分块一阶内积的相关性裁判）
 # =====================================================================
-def measure_mask_meta(model, batch, n_t=8, n_noise=2, seed=0):
+def measure_mask_meta(model, batch, n_t=8, n_noise=2, mask_ratio=None, seed=0):
     """
     空间版"ut × meta-grad"裁判——回答"G 作为掩码选址代理有没有价值"。
 
@@ -514,7 +514,9 @@ def measure_mask_meta(model, batch, n_t=8, n_noise=2, seed=0):
       - t 取训练网格等距 n_t 点 × n_noise 个 CRN 噪声（专用种子生成器，
         按 (image, t, j) 固定顺序取数——跨 ckpt 同图同噪声同 t，严格可比）；
       - IP 对 (t, ε) 取均值；逐图相关性 + 跨图均值/方差（画汇总带）；
-      - 掩码用模型自己的 mask_selector 现采（guided=True，与训练引导期同逻辑）。
+      - 掩码用模型自己的 mask_selector 现采（guided=True，与训练引导期同逻辑）；
+        mask_ratio=None 时用模型配置的 ratio——但旧 run 配置里 ratio=0（旧版
+        表"关闭"）或未启用掩码时，回退 0.25 作展示默认；
       - G 与 IP 共享 g_task 是断言本身决定的（"G 大的块 IP 也大"），非数据泄漏。
 
     Returns: dict ——
@@ -580,9 +582,12 @@ def measure_mask_meta(model, batch, n_t=8, n_noise=2, seed=0):
         rho_p.append(r_p)
 
         # ---- 掩码现采（训练引导期同逻辑；输入为 128×128 热力，与训练一致）----
+        sel = model.mask_selector
+        ratio = mask_ratio if mask_ratio is not None else (
+            sel.ratio if (sel.enabled and sel.ratio > 0) else 0.25)
         with torch.no_grad():
             heat128 = F.adaptive_avg_pool2d(g_task.abs().mean(dim=1, keepdim=True), S)
-            keep = model.mask_selector.select(heat128, guided=True)
+            keep = sel.select(heat128, guided=True, ratio=ratio)
             mask_blk = F.adaptive_avg_pool2d(keep, (g, g))
             img01 = ((xi.detach() * std + mean) / 255.0).clamp(0, 1)
             imgs.append(F.interpolate(img01, size=(S, S), mode='bilinear',
@@ -1138,15 +1143,16 @@ def plot_tweight_evolution(snaps, labels, save_path=None):
     return fig
 
 
-def plot_mask_meta(res, title='', save_path=None):
+def plot_mask_meta(res, title='', save_path=None, max_images=None):
     """mask-meta 四联图：原图 | 分块一阶内积 IP（正部热力）| 代理 G 热力 | 掩码 m。
-    每行 G 面板标注该图 64 块的 Spearman ρ / Pearson r。"""
+    每行 G 面板标注该图 64 块的 Spearman ρ / Pearson r。
+    max_images：只画前几张（统计用全部测量图，展示裁剪）。"""
     plt = _plt()
     img = res['img']
     ip = res['ip_block'].cpu().numpy()
     gb = res['g_block'].cpu().numpy()
     mk = res['mask'].cpu().numpy()
-    n = img.shape[0]
+    n = img.shape[0] if max_images is None else min(max_images, img.shape[0])
 
     fig, axes = plt.subplots(n, 4, figsize=(13.5, 3.4 * n))
     if n == 1:

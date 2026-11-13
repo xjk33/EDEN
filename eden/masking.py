@@ -43,12 +43,14 @@ class MaskSelector:
         self.warmup_iters = warmup_iters
         self._step = 0             # 已选址次数（训练步），预热计时用
 
-    def select(self, heatmap: torch.Tensor, guided: bool = None) -> torch.Tensor:
+    def select(self, heatmap: torch.Tensor, guided: bool = None,
+               ratio: float = None) -> torch.Tensor:
         """
         Args:
             heatmap: [B,1,H,W] 敏感度热力图 G
             guided:  None = 按内部计数器自动判定（前 warmup_iters 步为均匀采样）；
                      True/False = 强制引导/均匀（离线可视化用）
+            ratio:   本次调用的掩码量覆盖；None = 用 self.ratio
         Returns:
             keep-mask [B,1,H,W]，1=保留，0=蒙住
         """
@@ -61,7 +63,8 @@ class MaskSelector:
         H, W = heatmap.shape[-2:]
         g_h, g_w = max(1, H // p), max(1, W // p)
         n = g_h * g_w
-        k = max(1, int(round(self.ratio * n)))                 # 每图固定蒙块数
+        r = self.ratio if ratio is None else ratio
+        k = max(1, int(round(r * n)))                          # 每图固定蒙块数
 
         if guided:
             # 块内均值 -> 逐图 softmax 概率
