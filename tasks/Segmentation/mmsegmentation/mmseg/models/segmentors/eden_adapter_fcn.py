@@ -168,9 +168,8 @@ class FCNWithDiffAE(DiffAEMixin, EncoderDecoder):
         diffae_pred_x0: bool = False,
         diffae_mask_enabled: bool = False,
         diffae_mask_patch: int = 16,
-        diffae_mask_mu_h: float = 0.5,
-        diffae_mask_s_h: float = 0.1,
-        diffae_mask_warmup_ratio: float = 0.1,
+        diffae_mask_ratio: float = 0.25,
+        diffae_mask_alpha: float = 1.0,
         **kwargs,
     ):
         super().__init__(
@@ -226,9 +225,8 @@ class FCNWithDiffAE(DiffAEMixin, EncoderDecoder):
             diffae_pred_x0=diffae_pred_x0,
             diffae_mask_enabled=diffae_mask_enabled,
             diffae_mask_patch=diffae_mask_patch,
-            diffae_mask_mu_h=diffae_mask_mu_h,
-            diffae_mask_s_h=diffae_mask_s_h,
-            diffae_mask_warmup_ratio=diffae_mask_warmup_ratio,
+            diffae_mask_ratio=diffae_mask_ratio,
+            diffae_mask_alpha=diffae_mask_alpha,
             **kwargs,
         )
         self.image_size = image_size

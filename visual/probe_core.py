@@ -11,7 +11,7 @@
   1. ut 谱 + meta-gradient 金标准（ut 价值判据：两者相关性越高 ut 越可信），
      含测量缓存（npz）与论文拼图（n_ckpts × n_k 网格）
   2. t_weight / mu_table 快照与跨 ckpt 演化（t 自适应学到了什么）
-  3. 掩码选址可视化（任务引导结构化掩码的位置与剂量）
+  3. mask-meta（G 与分块一阶内积的空间相关性裁判，含掩码现采展示）
   4. 固定 t 的 loss 方差分解（大 t 抖动：测量噪声 vs 任务本质不稳定）
 
 注意：旧 checkpoint 的 t 自适应 buffer 键名（顶层 t_weight/d_table/...）在重构后
@@ -40,9 +40,10 @@ LEGACY_MODEL_KEYS = (
     't_weight_apply', 't_weight_pos_only', 't_weight_joint', 't_weight_p_min',
     't_weight_p_max', 't_weight_eta', 't_weight_eps', 't_weight_z_cap',
     't_weight_static_window',
-    'diffae_mask_ratio', 'diffae_mask_mode', 'diffae_mask_temp',
-    'diffae_mask_soft', 'diffae_mask_alpha', 'diffae_mask_dynamic',
-    'diffae_mask_ratio_max',
+    'diffae_mask_mode', 'diffae_mask_temp', 'diffae_mask_soft',
+    'diffae_mask_dynamic', 'diffae_mask_ratio_max',
+    # 过渡版（sigmoid 选址）的退役键
+    'diffae_mask_mu_h', 'diffae_mask_s_h', 'diffae_mask_warmup_ratio',
 )
 # 旧 adapter 类名 -> 现名（PCGrad 变体已合并/退役，权重布局与现类一致）
 LEGACY_MODEL_TYPES = {'FCNWithDiffAEPlusPCGrad': 'FCNWithDiffAE'}
@@ -494,42 +495,108 @@ def read_tweight_snapshot(model):
 
 
 # =====================================================================
-# 测量 4：蒙块选址（用模型自己的 mask_selector 现采，与训练同一套逻辑）
+# 测量 4：mask-meta（空间版 ut×meta-grad：G 与分块一阶内积的相关性裁判）
 # =====================================================================
-def measure_mask_selection(model, batch, num_images=4):
+def measure_mask_meta(model, batch, n_t=8, n_noise=2, seed=0):
     """
-    seg 输入梯度热力图 + mask_selector 现采蒙块。
-    Returns: dict —— img [n,3,S,S] (0~1) / heat [n,1,S,S]（归一化）/ keep [n,1,S,S]（有效保留率）
+    空间版"ut × meta-grad"裁判——回答"G 作为掩码选址代理有没有价值"。
+
+    真实量（一阶项的空间分解）：g_task = ∂L_task/∂x₀，g_den = ∂L_den/∂x₀，
+        IP_i = Σ_{p∈i} g_task(p)·g_den(p)
+    Σ_i IP_i = ⟨∂L_task/∂x₀, ∂L_den/∂x₀⟩，与论文 3.3 的一阶展开逐块对应；
+    输入空间分解是唯一可计算的"分块内积"（参数梯度的空间分解不可定义）。
+    代理量（在线 MaskSelector 同口径）：G_i = mean_{p∈i} |g_task(p)|。
+    逐图 64 块的 Spearman/Pearson：空间分布越吻合，G 选址越可信。
+
+    设计（与 ut_meta 同一套可靠性约定）：
+      - g_den 含 z_sem 通道与 x_t 直连两条梯度路径（与训练时 encoder 实际
+        收到的方向一致）；L_den 为 x0 预测的 MSE（与训练同参数化）；
+      - t 取训练网格等距 n_t 点 × n_noise 个 CRN 噪声（专用种子生成器，
+        按 (image, t, j) 固定顺序取数——跨 ckpt 同图同噪声同 t，严格可比）；
+      - IP 对 (t, ε) 取均值；逐图相关性 + 跨图均值/方差（画汇总带）；
+      - 掩码用模型自己的 mask_selector 现采（guided=True，与训练引导期同逻辑）。
+      - G 与 IP 共享 g_task 是断言本身决定的（"G 大的块 IP 也大"），非数据泄漏。
+
+    Returns: dict ——
+      img [N,3,S,S] (0~1) / g_block [N,g,g] / ip_block [N,g,g]（原始，含负值）/
+      mask [N,g,g]（0/1，块级）/ rho_s / rho_p [N]（逐图相关）/
+      t / logsnr（IP 测量用的 t 网格）
     """
-    xis = batch['xis'][:num_images]
-    dsis = batch['dsis'][:num_images]
-    device = xis[0].device
+    device = batch['x_diffae'].device
+    xis, dsis = batch['xis'], batch['dsis']
+    N = len(xis)
+    S = model.image_size
+    patch = model.mask_selector.patch
+    g = max(1, S // patch)
     mean = torch.tensor(IMAGENET_MEAN, device=device).view(1, 3, 1, 1)
     std = torch.tensor(IMAGENET_STD, device=device).view(1, 3, 1, 1)
 
-    heats, imgs = [], []
+    # t 网格：训练网格等距 n_t 点
+    grid = np.array(model.sampler.use_timesteps, dtype=np.int64)
+    idx = np.unique(np.linspace(0, len(grid) - 1, n_t).round().astype(int))
+    t_list = grid[idx]
+    n_fwd = len(t_list) * n_noise
+
+    # CRN：专用种子生成器，按 (image, t, j) 固定顺序取数 -> 跨 ckpt 同组噪声
+    gen = torch.Generator().manual_seed(seed)
+
+    imgs, g_blocks, ip_blocks, masks = [], [], [], []
+    rho_s, rho_p = [], []
     for xi, dsi in zip(xis, dsis):
         xg = xi.detach().requires_grad_(True)
         with torch.enable_grad():
+            # ---- g_task = ∂L_task/∂x₀（retain 图给后续 denoise 反传）----
             feats = model.backbone(xg)
             losses = model._decode_head_forward_train(feats, [dsi])
             task = sum(v for k, v in losses.items()
                        if isinstance(v, torch.Tensor) and 'loss' in k)
-            gx = torch.autograd.grad(task, xg)[0]
-        h = gx.abs().mean(dim=1, keepdim=True)
-        h = F.adaptive_avg_pool2d(h, model.image_size)
-        heats.append(h.detach())
-        with torch.no_grad():
-            img01 = ((xi.detach() * std + mean) / 255.0).clamp(0, 1)
-            imgs.append(F.interpolate(img01, size=(model.image_size, model.image_size),
-                                      mode='bilinear', align_corners=False))
+            g_task = torch.autograd.grad(task, xg, retain_graph=True)[0].detach()
 
-    heat = torch.cat(heats, 0)
-    img = torch.cat(imgs, 0)
-    heat_n = heat / heat.flatten(1).max(dim=1).values.view(-1, 1, 1, 1).clamp_min(1e-8)
-    with torch.no_grad():
-        keep = model.mask_selector.select(heat, guided=True)   # 0/1 keep-mask（强制引导模式）
-    return {'img': img, 'heat': heat_n, 'keep': keep}
+            # ---- g_den = ∂L_den/∂x₀，对 (t, ε) 逐次反传并累加逐像素内积 ----
+            cond = model.diffae_enc_compress(model.encode_diffae(xg))
+            xd = model._to_diffae_range(xg)              # 带梯度：xg -> [-1,1] 扩散输入
+            ip_map = torch.zeros(1, 1, *xg.shape[-2:], device=device)
+            for k_fwd, t_val in enumerate(t_list):
+                t = torch.full((1,), int(t_val), device=device, dtype=torch.long)
+                for j in range(n_noise):
+                    noise = torch.randn(xd.shape, generator=gen).to(device)
+                    x_t = model.sampler.q_sample(xd, t, noise)
+                    pred = model.diffae_unet(x_t, t, cond)
+                    target = xd if model.sampler.predict_x0 else noise
+                    l_den = F.mse_loss(pred, target)
+                    last = (k_fwd == len(t_list) - 1) and (j == n_noise - 1)
+                    g_den = torch.autograd.grad(l_den, xg,
+                                                retain_graph=not last)[0].detach()
+                    ip_map += (g_task * g_den).sum(dim=1, keepdim=True)
+            ip_map /= n_fwd
+            del cond, xd
+
+        # ---- 块级聚合（均值即可：逐图常数因子不影响秩相关）----
+        g_blk = F.adaptive_avg_pool2d(g_task.abs().mean(dim=1, keepdim=True), (g, g))
+        ip_blk = F.adaptive_avg_pool2d(ip_map, (g, g))
+        r_s, _ = spearman(g_blk.flatten().cpu().numpy(), ip_blk.flatten().cpu().numpy())
+        r_p = pearson(g_blk.flatten().cpu().numpy(), ip_blk.flatten().cpu().numpy())
+        rho_s.append(r_s)
+        rho_p.append(r_p)
+
+        # ---- 掩码现采（训练引导期同逻辑；输入为 128×128 热力，与训练一致）----
+        with torch.no_grad():
+            heat128 = F.adaptive_avg_pool2d(g_task.abs().mean(dim=1, keepdim=True), S)
+            keep = model.mask_selector.select(heat128, guided=True)
+            mask_blk = F.adaptive_avg_pool2d(keep, (g, g))
+            img01 = ((xi.detach() * std + mean) / 255.0).clamp(0, 1)
+            imgs.append(F.interpolate(img01, size=(S, S), mode='bilinear',
+                                      align_corners=False))
+        g_blocks.append(g_blk.detach())
+        ip_blocks.append(ip_blk.detach())
+        masks.append(mask_blk.detach())
+
+    ab = model.sampler.alphas_cumprod.detach().cpu().numpy()
+    logsnr = np.log(ab / (1.0 - ab))[t_list]
+    return {'img': torch.cat(imgs, 0), 'g_block': torch.cat(g_blocks, 0),
+            'ip_block': torch.cat(ip_blocks, 0), 'mask': torch.cat(masks, 0),
+            'rho_s': np.array(rho_s), 'rho_p': np.array(rho_p),
+            't': t_list, 'logsnr': logsnr}
 
 
 # =====================================================================
@@ -1071,26 +1138,36 @@ def plot_tweight_evolution(snaps, labels, save_path=None):
     return fig
 
 
-def plot_mask_selection(sel, title='', save_path=None):
-    """蒙块选址三联图：原图 | seg 梯度热力 | 蒙版叠加（蒙区染红）。"""
+def plot_mask_meta(res, title='', save_path=None):
+    """mask-meta 四联图：原图 | 分块一阶内积 IP（正部热力）| 代理 G 热力 | 掩码 m。
+    每行 G 面板标注该图 64 块的 Spearman ρ / Pearson r。"""
     plt = _plt()
-    img, heat, keep = sel['img'], sel['heat'], sel['keep']
+    img = res['img']
+    ip = res['ip_block'].cpu().numpy()
+    gb = res['g_block'].cpu().numpy()
+    mk = res['mask'].cpu().numpy()
     n = img.shape[0]
-    red = torch.tensor([1.0, 0.1, 0.1], device=img.device).view(1, 3, 1, 1)
-    overlay = img * keep + (red.expand_as(img) * 0.55 + img * 0.45) * (1.0 - keep)
 
-    fig, axes = plt.subplots(n, 3, figsize=(10, 3.4 * n))
+    fig, axes = plt.subplots(n, 4, figsize=(13.5, 3.4 * n))
     if n == 1:
         axes = axes[None, :]
     for i in range(n):
+        ip_pos = np.clip(ip[i, 0], 0, None)              # 正部：只有正贡献参与选址
         axes[i, 0].imshow(img[i].permute(1, 2, 0).cpu().numpy())
-        axes[i, 0].set_title('image')
-        im = axes[i, 1].imshow(heat[i, 0].cpu().numpy(), cmap='turbo', vmin=0, vmax=1)
-        axes[i, 1].set_title('seg heat')
-        fig.colorbar(im, ax=axes[i, 1], fraction=0.046)
-        axes[i, 2].imshow(overlay[i].permute(1, 2, 0).cpu().numpy())
-        axes[i, 2].set_title(f'mask (kept={keep[i].mean().item():.2f})')
-        for j in range(3):
+        axes[i, 0].set_title('image', fontsize=10)
+        im1 = axes[i, 1].imshow(ip_pos, cmap='turbo')
+        axes[i, 1].set_title('meta IP ⟨g_task, g_den⟩ (pos)', fontsize=10)
+        fig.colorbar(im1, ax=axes[i, 1], fraction=0.046)
+        im2 = axes[i, 2].imshow(gb[i, 0], cmap='turbo')
+        axes[i, 2].set_title(
+            f'proxy G = |g_task| (ρ_s={res["rho_s"][i]:.2f}, '
+            f'r_p={res["rho_p"][i]:.2f})', fontsize=10)
+        fig.colorbar(im2, ax=axes[i, 2], fraction=0.046)
+        axes[i, 3].imshow(mk[i, 0], cmap='gray', vmin=0, vmax=1,
+                          interpolation='nearest')
+        axes[i, 3].set_title(f'mask m (masked={1 - mk[i, 0].mean():.2f})',
+                             fontsize=10)
+        for j in range(4):
             axes[i, j].axis('off')
     fig.suptitle(title)
     fig.tight_layout()

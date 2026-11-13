@@ -1,21 +1,21 @@
 """
-结构化掩码：任务引导的选址 + 替换型施加（定稿方案）
+结构化掩码：任务引导的选址 + 软替换施加
 
 拆分自 diffae_mixin.py，两个组件各司其职：
-  MaskSelector —— 选址：从下游任务敏感度 G 得到逐块掩码概率并独立采样
-  MaskApplier  —— 施加：x̃₀ = m⊙c + (1−m)⊙x₀（替换型退化，c 为数据集均值色），
+  MaskSelector —— 选址：从下游任务敏感度 G 得到逐块概率，按概率定量采样
+  MaskApplier  —— 施加：软替换退化（蒙区向均值色按 alpha 混合），
                   输出 sampler.training_losses 的输入参数
 
-方法学映射（与论文 3.3 节一一对应）：
+机制：
   - 空间敏感度 G = |∂L_task/∂x₀|（在 adapter 中计算，此处只消费热力图）
-  - 块级敏感度 = 划分为 b×b 块、块内取平均、逐图归一化（min-max 到 [0,1]）
-  - 掩码概率   = p_i = σ((h_i − μ_h)/s_h)：μ_h 控触发阈值，s_h 控过渡带软硬；
-    逐图归一化使 h_i 不随任务损失量级漂移；sigmoid 软门控而非硬阈值
-  - 掩码采样   = 各块以 p_i 独立采样二值掩码（每图蒙块数量随机，期望 Σp_i）
-  - 预热期     = 前 warmup_iters 步 p_i 恒为 warmup_ratio（均匀随机采样，
+  - 块级概率   = G 划块取均值得 h，逐图 softmax 得逐块概率 p
+  - 掩码采样   = 每图按 p 无放回采固定数量 k = round(ratio·n) 个块
+    （Gumbel-top-k 技巧：log p + Gumbel 噪声取前 k，等价于按 p 无放回采样）
+  - 预热期     = 前 warmup_iters 步退化为均匀采样（同样 k 块、位置随机，
     不启用 G 引导），预热结束与 t 自适应同时启用引导
-  - 施加       = 掩码只作用于扩散分支输入；loss 目标始终是完整 x₀，
-    无掩码时自然退化为标准扩散训练
+  - 施加       = x̃₀ = (1−α(1−m))⊙x₀ + α(1−m)⊙c（m：keep-mask，c 为该图
+    自己的均值色）；alpha=1 完全替换，alpha=0 退化为标准扩散；loss 目标
+    始终是完整 x₀，蒙区内容的唯一信息源是 cond（z_sem）
 """
 import torch
 import torch.nn as nn
@@ -26,25 +26,21 @@ class MaskSelector:
     """
     选址：敏感度热力图 -> 0/1 keep-mask [B,1,H,W]（1=保留，0=被选中蒙住）。
 
-    每块独立 Bernoulli：p_i = σ((h_i − μ_h)/s_h)，h_i 为逐图 min-max 归一化的
-    块级敏感度；预热期内 p_i 恒为 warmup_ratio（均匀随机采样）。
+    每图按 softmax(h) 概率无放回采固定 k = round(ratio·n) 个块；
+    预热期内概率退化为均匀（同样 k 块、位置随机）。
     """
 
     def __init__(
         self,
         enabled: bool = False,     # 总开关
-        patch: int = 16,           # 蒙块边长（像素；128 图上 16px = 8×8 块）
-        mu_h: float = 0.5,         # sigmoid 触发阈值（归一化敏感度坐标）
-        s_h: float = 0.1,          # sigmoid 过渡带软硬（越小越接近硬阈值）
+        patch: int = 16,           # 蒙块边长（像素；128 图上 16px = 8×8 = 64 块）
+        ratio: float = 0.25,       # 掩码量：每图蒙块比例（块数 = round(ratio·n)）
         warmup_iters: int = 5000,  # 预热期：均匀随机采样，不启用 G 引导
-        warmup_ratio: float = 0.1, # 预热期均匀掩码概率（每块独立）
     ):
         self.enabled = enabled
         self.patch = patch
-        self.mu_h = mu_h
-        self.s_h = s_h
+        self.ratio = ratio
         self.warmup_iters = warmup_iters
-        self.warmup_ratio = warmup_ratio
         self._step = 0             # 已选址次数（训练步），预热计时用
 
     def select(self, heatmap: torch.Tensor, guided: bool = None) -> torch.Tensor:
@@ -64,37 +60,42 @@ class MaskSelector:
         p = self.patch
         H, W = heatmap.shape[-2:]
         g_h, g_w = max(1, H // p), max(1, W // p)
+        n = g_h * g_w
+        k = max(1, int(round(self.ratio * n)))                 # 每图固定蒙块数
 
         if guided:
-            # 块内均值 -> 逐图 min-max 归一化 -> sigmoid 伪概率
-            h = F.adaptive_avg_pool2d(heatmap, (g_h, g_w))           # [B,1,g_h,g_w]
-            hmin = h.amin(dim=(2, 3), keepdim=True)
-            hmax = h.amax(dim=(2, 3), keepdim=True)
-            h = (h - hmin) / (hmax - hmin).clamp_min(1e-8)
-            prob = torch.sigmoid((h - self.mu_h) / self.s_h)
+            # 块内均值 -> 逐图 softmax 概率
+            h = F.adaptive_avg_pool2d(heatmap, (g_h, g_w)).reshape(B, n)
+            prob = torch.softmax(h, dim=1)
         else:
-            # 预热期：均匀随机采样（不启用 G 引导）
-            prob = torch.full((B, 1, g_h, g_w), self.warmup_ratio,
-                              device=heatmap.device)
+            # 预热期：均匀概率（位置随机，数量相同）
+            prob = torch.full((B, n), 1.0 / n, device=heatmap.device)
 
-        sel = torch.bernoulli(prob)                                  # 1=蒙住
-        keep = 1.0 - sel
+        # Gumbel-top-k：log p + Gumbel 噪声取前 k = 按 p 无放回采样
+        u = torch.rand_like(prob).clamp_min(1e-12)
+        score = torch.log(prob.clamp_min(1e-12)) - torch.log(-torch.log(u))
+        order = score.argsort(dim=1, descending=True)            # [B, n]
+        rank = torch.empty_like(order)
+        rank.scatter_(1, order, torch.arange(n, device=heatmap.device)
+                      .unsqueeze(0).expand(B, n))
+        sel = rank < k                                           # [B, n] 前 k 个被选中
+
+        keep = (~sel).float().view(B, 1, g_h, g_w)
         mask = keep.repeat_interleave(p, dim=2).repeat_interleave(p, dim=3)
         return mask[:, :, :H, :W]
 
 
 class MaskApplier(nn.Module):
     """
-    施加：替换型退化 x̃₀ = m⊙c + (1−m)⊙x₀（keep-mask m：1=保留），
-    c 为数据集均值色；loss 目标始终是完整原图（target_override），
+    施加：软替换退化 x̃₀ = w⊙x₀ + (1−w)⊙c，w = 1−α(1−m)
+    （m：keep-mask，1=保留；c 为每张图自己的均值色；alpha 控替换程度——
+    1 = 完全替换，0 = 不蒙）。loss 目标始终是完整原图（target_override），
     蒙区内容的唯一信息源是 cond（z_sem）。
     """
 
-    def __init__(self):
+    def __init__(self, alpha: float = 1.0):
         super().__init__()
-        # 替换色 c：ImageNet 均值在 [-1,1] 空间的取值（恰好等于 padding 的颜色）
-        _mu = [(123.675 / 255.0) * 2 - 1, (116.28 / 255.0) * 2 - 1, (103.53 / 255.0) * 2 - 1]
-        self.register_buffer('mask_mean', torch.tensor(_mu).view(1, 3, 1, 1))
+        self.alpha = alpha
 
     def transform(self, x_start: torch.Tensor,
                   mask: "torch.Tensor | None") -> dict:
@@ -104,8 +105,11 @@ class MaskApplier(nn.Module):
         """
         if mask is None:
             return {"x_start": x_start}
-        x_in = mask * x_start + (1.0 - mask) * self.mask_mean.to(x_start.device)
+        # 替换色 c：逐图均值色（蒙区与原图色调一致，只毁局部内容、不漏全局常量）
+        c = x_start.mean(dim=(2, 3), keepdim=True)
+        w_keep = 1.0 - self.alpha * (1.0 - mask)       # 蒙块处 = 1−alpha
+        x_in = w_keep * x_start + (1.0 - w_keep) * c
         return {
-            "x_start": x_in,                 # 输入：蒙区替换为均值色
+            "x_start": x_in,                 # 输入：蒙区向该图均值色按 alpha 混合
             "target_override": x_start,      # 目标：原始干净图（蒙区内容只能靠 z_sem）
         }

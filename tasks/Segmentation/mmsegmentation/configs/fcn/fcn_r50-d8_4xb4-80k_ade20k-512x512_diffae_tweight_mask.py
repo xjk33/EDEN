@@ -17,9 +17,8 @@ model = dict(
     diffae_pred_x0=True,
     diffae_mask_enabled=True,
     diffae_mask_patch=16,
-    diffae_mask_mu_h=0.5,
-    diffae_mask_s_h=0.1,
-    diffae_mask_warmup_ratio=0.1,
+    diffae_mask_ratio=0.25,
+    diffae_mask_alpha=1.0,
 )
 
 work_dir = './work_dirs/eden/fcn_diffae_tweight_mask'

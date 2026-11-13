@@ -135,10 +135,9 @@ class DiffAEMixin(nn.Module):
         # ---- 结构化掩码（选址见 masking.MaskSelector，施加见 masking.MaskApplier）----
         diffae_pred_x0: bool = False,     # True = 网络直接预测 x0（可见区去噪 + 蒙区靠 z_sem 重构）
         diffae_mask_enabled: bool = False,# 任务引导结构化掩码总开关
-        diffae_mask_patch: int = 16,      # 蒙块边长（像素；128 图上 16px = 8×8 块）
-        diffae_mask_mu_h: float = 0.5,    # sigmoid 触发阈值（归一化敏感度坐标）
-        diffae_mask_s_h: float = 0.1,     # sigmoid 过渡带软硬
-        diffae_mask_warmup_ratio: float = 0.1,  # 预热期均匀掩码概率（每块独立）
+        diffae_mask_patch: int = 16,      # 蒙块边长（像素；128 图上 16px = 8×8 = 64 块）
+        diffae_mask_ratio: float = 0.25,  # 掩码量：每图按 softmax(G) 概率无放回采 round(ratio·n) 块
+        diffae_mask_alpha: float = 1.0,   # 软替换程度：蒙区向均值色混合的强度（1=完全替换，0=不蒙）
         # ---- ANTS：可学习 Beta t 采样器（实现见 beta_sampler.py，与 t_weight 互斥）----
         ants_enabled: bool = False,
         ants_lr: float = 1e-3,                 # 采样器 Adam lr（原文 1e-3）
@@ -238,12 +237,10 @@ class DiffAEMixin(nn.Module):
         self.mask_selector = MaskSelector(
             enabled=diffae_mask_enabled,
             patch=diffae_mask_patch,
-            mu_h=diffae_mask_mu_h,
-            s_h=diffae_mask_s_h,
+            ratio=diffae_mask_ratio,
             warmup_iters=t_weight_warmup_iters,
-            warmup_ratio=diffae_mask_warmup_ratio,
         )
-        self.mask_applier = MaskApplier()
+        self.mask_applier = MaskApplier(alpha=diffae_mask_alpha)
 
         # ---- ANTS：可学习 Beta t 采样器（Kim et al. CVPR 2025 简化复现）----
         # 与 t_weight 互斥（两者都决定 t 的采样分布）；与 custom_timestep_sampler
