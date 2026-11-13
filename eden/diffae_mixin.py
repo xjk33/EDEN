@@ -4,16 +4,16 @@ DiffAE Mixin + EMA Manager
 设计原则：
   - 只提供扩散预训练的"能力"和"工具函数"。
   - 不假设任何下游框架的 forward / train_step 签名。
-  - t 自适应（Dt 探针 + 权重调度）与结构化加噪（选址 + 施加）分别独立在
+  - t 自适应（贡献度探针 + 采样分布调度）与结构化掩码（选址 + 施加）分别独立在
     t_adaptive.py 和 masking.py，本文件只做组合。
 
-x0 预测 + 空间蒙块（单次 loss 全包，无辅助 loss）：
+x0 预测 + 结构化掩码（单次 loss 全包，无辅助 loss）：
   - diffae_pred_x0=True 时 UNet 直接预测 x0：可见区=去噪，蒙区=内容重构（唯一信息源 z_sem）
-  - 蒙块选址见 masking.MaskSelector；软/硬施加见 masking.MaskApplier
+  - 掩码选址见 masking.MaskSelector；替换型施加见 masking.MaskApplier
   - loss 全程在图像空间（x0 模式），任何 t 有界
 
 对外暴露的训练接口只有 forward_diffae；监控钩子需要的内部状态通过
-本类的委托属性（t_weight / d_table / bin_rep_t / _ts_counts / _heatmap_to_mask）
+本类的委托属性（t_weight / mu_table / bin_rep_t / _ts_counts / _heatmap_to_mask）
 访问，实现细节均在子模块里。
 """
 import numpy as np
@@ -129,23 +129,16 @@ class DiffAEMixin(nn.Module):
         t_weight_interval: int = 500,
         t_weight_ema: float = 0.95,
         t_weight_probe_batch: int = 16,
-        t_weight_static_window: Optional[List[int]] = None,  # 如 [100,500]，设置后禁用动态更新
         t_weight_k: float = 1.0,        # 贡献度 μ 的不确定性惩罚系数（D − k·σ_D）
         t_weight_delta: float = 1e-3,   # 贡献度 μ 的量纲归一保护常数（E[L_0] + δ）
-        t_weight_joint: bool = False,     # True = cos 计分：1-cos(ε̂_cond, ε̂_zero)
-        t_weight_p_min: float = 0.005,    # 探索地板（每区间采样概率下界）
-        t_weight_p_max: float = 0.3,      # 防坍缩截断（每区间采样概率上界）
-        t_weight_apply: str = 'loss',     # 'loss' = 加权 loss；'sample' = 作为 t 的采样分布
-        # ---- 结构化加噪（选址见 masking.MaskSelector，施加见 masking.MaskApplier）----
+        t_weight_eps: Optional[float] = None,  # 采样分布的均匀保底总份额；None = 1/K
+        # ---- 结构化掩码（选址见 masking.MaskSelector，施加见 masking.MaskApplier）----
         diffae_pred_x0: bool = False,     # True = 网络直接预测 x0（可见区去噪 + 蒙区靠 z_sem 重构）
-        diffae_mask_ratio: float = 0.0,   # 蒙块比例 0~1，0 = 关闭
-        diffae_mask_patch: int = 16,      # 蒙块边长（像素）
-        diffae_mask_mode: str = "random", # 'random' | 'hot' | 'cold'（后两者需下游热力图）
-        diffae_mask_temp: float = 1.0,    # 热力采样温度：<1 更平，>1 更尖
-        diffae_mask_soft: bool = False,   # True = 软蒙（加噪前向均值色混合）；False = 硬蒙（加噪后置零）
-        diffae_mask_alpha: float = 1.0,   # 软蒙混合强度：0=不蒙, 1=完全均值色
-        diffae_mask_dynamic: bool = False,# True = 每图每步 r~U[0, ratio_max]；False = 固定 mask_ratio
-        diffae_mask_ratio_max: float = 0.3,
+        diffae_mask_enabled: bool = False,# 任务引导结构化掩码总开关
+        diffae_mask_patch: int = 16,      # 蒙块边长（像素；128 图上 16px = 8×8 块）
+        diffae_mask_mu_h: float = 0.5,    # sigmoid 触发阈值（归一化敏感度坐标）
+        diffae_mask_s_h: float = 0.1,     # sigmoid 过渡带软硬
+        diffae_mask_warmup_ratio: float = 0.1,  # 预热期均匀掩码概率（每块独立）
         # ---- ANTS：可学习 Beta t 采样器（实现见 beta_sampler.py，与 t_weight 互斥）----
         ants_enabled: bool = False,
         ants_lr: float = 1e-3,                 # 采样器 Adam lr（原文 1e-3）
@@ -224,7 +217,7 @@ class DiffAEMixin(nn.Module):
         self.ema = EMAManager([self.diffae_unet, self.diffae_enc_compress], decay=ema_decay)
         self._ema_enabled = True
 
-        # ---- t 自适应：Dt 探针 + 权重调度（实现见 t_adaptive.py）----
+        # ---- t 自适应：贡献度探针 + 采样分布调度（实现见 t_adaptive.py）----
         self.t_adaptive = TAdaptive(
             enabled=t_weight_enabled,
             num_timesteps=num_diffusion_timesteps,
@@ -237,23 +230,20 @@ class DiffAEMixin(nn.Module):
             warmup_iters=t_weight_warmup_iters,
             k=t_weight_k,
             delta=t_weight_delta,
-            p_min=t_weight_p_min,
-            p_max=t_weight_p_max,
-            joint=t_weight_joint,
-            apply=t_weight_apply,
-            static_window=t_weight_static_window,
+            eps=t_weight_eps,
         )
 
-        # ---- 结构化加噪：选址 + 施加（实现见 masking.py）----
+        # ---- 结构化掩码：选址 + 施加（实现见 masking.py）----
+        # 掩码预热与 t 自适应共用同一个 W：预热结束同时启用（方案 3.4）
         self.mask_selector = MaskSelector(
+            enabled=diffae_mask_enabled,
             patch=diffae_mask_patch,
-            mode=diffae_mask_mode,
-            temp=diffae_mask_temp,
-            ratio=diffae_mask_ratio,
-            dynamic=diffae_mask_dynamic,
-            ratio_max=diffae_mask_ratio_max,
+            mu_h=diffae_mask_mu_h,
+            s_h=diffae_mask_s_h,
+            warmup_iters=t_weight_warmup_iters,
+            warmup_ratio=diffae_mask_warmup_ratio,
         )
-        self.mask_applier = MaskApplier(soft=diffae_mask_soft, alpha=diffae_mask_alpha)
+        self.mask_applier = MaskApplier()
 
         # ---- ANTS：可学习 Beta t 采样器（Kim et al. CVPR 2025 简化复现）----
         # 与 t_weight 互斥（两者都决定 t 的采样分布）；与 custom_timestep_sampler
@@ -303,14 +293,7 @@ class DiffAEMixin(nn.Module):
 
         # 配置镜像（adapter / 监控钩子读取用；实现细节都在子模块里）
         self.diffae_pred_x0 = diffae_pred_x0
-        self.diffae_mask_ratio = diffae_mask_ratio
         self.diffae_mask_patch = diffae_mask_patch
-        self.diffae_mask_mode = diffae_mask_mode
-        self.diffae_mask_temp = diffae_mask_temp
-        self.diffae_mask_soft = diffae_mask_soft
-        self.diffae_mask_alpha = diffae_mask_alpha
-        self.diffae_mask_dynamic = diffae_mask_dynamic
-        self.diffae_mask_ratio_max = diffae_mask_ratio_max
 
     # ------------------------------------------------------------------
     # 子类必须实现的接口
@@ -327,8 +310,8 @@ class DiffAEMixin(nn.Module):
         return self.t_adaptive.scheduler.t_weight
 
     @property
-    def d_table(self) -> torch.Tensor:
-        return self.t_adaptive.probe.d_table
+    def mu_table(self) -> torch.Tensor:
+        return self.t_adaptive.probe.mu_table
 
     @property
     def bin_rep_t(self) -> torch.Tensor:
@@ -354,12 +337,12 @@ class DiffAEMixin(nn.Module):
             x_start: [B, C, H, W]，已归一化到 [-1, 1] 的真实图像
             cond:    [B, cond_dim]，已压缩的语义条件（由子类通过 encode_diffae + diffae_enc_compress 得到）
             input_mask: [B,1,H,W] 互补蒙块（1=保留，0=蒙住），由子类从下游任务敏感度
-                        热力图经 mask_selector 生成；None = 不启用。施加方式（软/硬）
-                        由 mask_applier 决定，loss 目标始终是完整 x0/ε，
+                        热力图经 mask_selector 生成；None = 不启用。替换型施加
+                        由 mask_applier 完成，loss 目标始终是完整 x0/ε，
                         蒙区内容的唯一信息源是 cond（z_sem）。
         Returns:
             dict: {
-                'loss_diffae': scalar Tensor（t 加权后）,
+                'loss_diffae': scalar Tensor（均匀聚合）,
                 'z_sem': [B, cond_dim],
                 'tw_ent': t_weight 归一化熵（监控用，无 'loss' 字样不会进 loss 求和）,
                 'tw_max': t_weight 最大桶权重（监控用）,
@@ -370,7 +353,7 @@ class DiffAEMixin(nn.Module):
         if self.training and self.auto_ema:
             self.ema.step()
 
-        # t 自适应：探针测 Dt -> 调度器更新 wt ->（apply='sample' 时）给出 t 采样分布
+        # t 自适应：探针测 μt -> 调度器更新 t 采样分布
         # （探针开销 < 训练 1%，且始终用未蒙块的原始 x_start 测量）
         t_probs = self.t_adaptive.on_train_step(
             self.diffae_unet, self.sampler, x_start, cond, training=self.training)
@@ -406,7 +389,7 @@ class DiffAEMixin(nn.Module):
                 t_override = (torch.round(t_f / step) * step).long().clamp_(
                     0, self.khun_phase1_t)
 
-        # 结构化加噪：MaskApplier 把蒙块翻译成 sampler 的输入（软蒙/硬蒙/无蒙）
+        # 结构化掩码：MaskApplier 把蒙块翻译成 sampler 的输入（替换型退化/无蒙）
         loss_kwargs = self.mask_applier.transform(x_start, input_mask)
         losses = self.sampler.training_losses(
             model=self.diffae_unet,
@@ -421,8 +404,8 @@ class DiffAEMixin(nn.Module):
 
         self.t_adaptive.record_samples(t)
 
-        # ---- 主 loss 聚合（t 加权仅 apply='loss' 时启用；'sample' 时均匀聚合）----
-        loss = self.t_adaptive.weight_loss(loss_per_sample, t)
+        # ---- 主 loss 聚合：均匀（t 的控制全部走采样分布，不重复加权 loss）----
+        loss = loss_per_sample.mean()
 
         w = self.t_adaptive.scheduler.t_weight
         tw_ent = -(w * torch.log(w.clamp_min(1e-12))).sum() / np.log(self.t_adaptive.probe.num_bins)
@@ -450,7 +433,7 @@ class DiffAEMixin(nn.Module):
     def _ants_measure(self, x: torch.Tensor, cond: torch.Tensor,
                       noises: Optional[List[torch.Tensor]] = None):
         """在代表时间步集 S 上测 per-sample 扩散 MSE；noises 给定则复用（CRN 配对）。
-        与 DtProbe 同一约定：始终用未蒙块的原始 x_start 测量。
+        与 UtProbe 同一约定：始终用未蒙块的原始 x_start 测量。
         Returns: (loss [B, |S|], noises list)"""
         ls, ns = [], []
         for i, tau in enumerate(self.ants_sampler.rep_timesteps):

@@ -1,30 +1,25 @@
-# EDEN 消融臂 4/4：DiffAE + t 自适应 + 结构化噪声（终版组合）
-# = fcn_diffae_tweight 与 fcn_diffae_mask 的并集。
+# EDEN 消融臂：DiffAE + t 自适应 + 结构化掩码（终版组合，论文 3.2 + 3.3）
+# = fcn_diffae_tweight 与 fcn_diffae_mask 的并集；
+# 预热 W 步内 t 均匀采样 + 掩码均匀随机，预热结束两者同时启用（方案 3.4）。
 _base_ = ['./fcn_r50-d8_4xb4-80k_ade20k-512x512_diffae.py']
 
 model = dict(
     # ---- t 自适应 ----
     t_weight_enabled=True,
-    t_weight_apply='sample',
-    t_weight_pos_only=True,
-    t_weight_joint=False,
-    t_weight_z_cap=1.0,
     t_weight_warmup_iters=5000,
-    t_weight_eta=2.0,
-    t_weight_eps=0.1,
     t_weight_bins=16,
     t_weight_interval=500,
     t_weight_ema=0.95,
-    # ---- x0 参数化 + 结构化噪声 ----
+    t_weight_probe_batch=16,
+    t_weight_k=1.0,
+    t_weight_delta=1e-3,
+    # ---- x0 参数化 + 结构化掩码 ----
     diffae_pred_x0=True,
-    diffae_mask_mode='hot',
+    diffae_mask_enabled=True,
     diffae_mask_patch=16,
-    diffae_mask_temp=1.0,
-    diffae_mask_soft=True,
-    diffae_mask_alpha=1.0,
-    diffae_mask_dynamic=True,
-    diffae_mask_ratio_max=0.3,
-    diffae_mask_ratio=0.25,
+    diffae_mask_mu_h=0.5,
+    diffae_mask_s_h=0.1,
+    diffae_mask_warmup_ratio=0.1,
 )
 
 work_dir = './work_dirs/eden/fcn_diffae_tweight_mask'

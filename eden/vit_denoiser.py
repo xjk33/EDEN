@@ -159,7 +159,7 @@ class ConditionalDiT(nn.Module):
     def forward(self, x: torch.Tensor, t: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            x: [B, C, H, W]  噪声图像 x_t（可能已被软/硬蒙块破坏）
+            x: [B, C, H, W]  噪声图像 x_t（可能已被掩码替换退化）
             t: [B]            离散 timestep
             cond: [B, cond_dim] 语义条件 z_sem（零向量 = 去条件探针）
         Returns:

@@ -161,23 +161,16 @@ class FCNWithDiffAE(DiffAEMixin, EncoderDecoder):
         t_weight_interval: int = 500,
         t_weight_ema: float = 0.95,
         t_weight_probe_batch: int = 16,
-        t_weight_static_window=None,
         t_weight_k: float = 1.0,        # 贡献度 μ 的不确定性惩罚系数（D − k·σ_D）
         t_weight_delta: float = 1e-3,   # 贡献度 μ 的量纲归一保护常数（E[L_0] + δ）
-        t_weight_joint: bool = False,
-        t_weight_p_min: float = 0.005,  # 探索地板（每区间采样概率下界）
-        t_weight_p_max: float = 0.3,    # 防坍缩截断（每区间采样概率上界）
-        t_weight_apply: str = 'sample',
-        # ---- 结构化噪声（透传给 DiffAEMixin -> MaskSelector / MaskApplier）----
+        t_weight_eps=None,              # 采样分布的均匀保底总份额；None = 1/K
+        # ---- 结构化掩码（透传给 DiffAEMixin -> MaskSelector / MaskApplier）----
         diffae_pred_x0: bool = False,
-        diffae_mask_ratio: float = 0.0,
+        diffae_mask_enabled: bool = False,
         diffae_mask_patch: int = 16,
-        diffae_mask_mode: str = "random",
-        diffae_mask_temp: float = 1.0,
-        diffae_mask_soft: bool = True,
-        diffae_mask_alpha: float = 1.0,
-        diffae_mask_dynamic: bool = True,
-        diffae_mask_ratio_max: float = 0.3,
+        diffae_mask_mu_h: float = 0.5,
+        diffae_mask_s_h: float = 0.1,
+        diffae_mask_warmup_ratio: float = 0.1,
         **kwargs,
     ):
         super().__init__(
@@ -227,22 +220,15 @@ class FCNWithDiffAE(DiffAEMixin, EncoderDecoder):
             t_weight_interval=t_weight_interval,
             t_weight_ema=t_weight_ema,
             t_weight_probe_batch=t_weight_probe_batch,
-            t_weight_static_window=t_weight_static_window,
             t_weight_k=t_weight_k,
             t_weight_delta=t_weight_delta,
-            t_weight_joint=t_weight_joint,
-            t_weight_p_min=t_weight_p_min,
-            t_weight_p_max=t_weight_p_max,
-            t_weight_apply=t_weight_apply,
+            t_weight_eps=t_weight_eps,
             diffae_pred_x0=diffae_pred_x0,
-            diffae_mask_ratio=diffae_mask_ratio,
+            diffae_mask_enabled=diffae_mask_enabled,
             diffae_mask_patch=diffae_mask_patch,
-            diffae_mask_mode=diffae_mask_mode,
-            diffae_mask_temp=diffae_mask_temp,
-            diffae_mask_soft=diffae_mask_soft,
-            diffae_mask_alpha=diffae_mask_alpha,
-            diffae_mask_dynamic=diffae_mask_dynamic,
-            diffae_mask_ratio_max=diffae_mask_ratio_max,
+            diffae_mask_mu_h=diffae_mask_mu_h,
+            diffae_mask_s_h=diffae_mask_s_h,
+            diffae_mask_warmup_ratio=diffae_mask_warmup_ratio,
             **kwargs,
         )
         self.image_size = image_size
@@ -317,22 +303,18 @@ class FCNWithDiffAE(DiffAEMixin, EncoderDecoder):
         if self.with_auxiliary_head:
             losses.update(self._auxiliary_head_forward_train(seg_feats, data_samples))
 
-        # 2.5) 梯度热力图 -> 结构化噪声选址（每步、逐样本；autograd.grad 只取输入梯度、
-        #      不写参数梯度、retain 图给后续联合 backward）
+        # 2.5) 梯度热力图 G = |∂L_task/∂x₀| -> 结构化掩码选址（每步、逐样本；
+        #      autograd.grad 只取输入梯度、不写参数梯度、retain 图给后续联合 backward；
+        #      预热期内 selector 自动退化为均匀随机采样，G 照算但不生效）
         mask = None
         if want_mask:
-            if self.mask_selector.mode == 'random':
-                # 均匀蒙块不需要 seg 梯度：省掉整次反传
-                heatmap = torch.zeros(inputs.shape[0], 1, self.image_size, self.image_size,
-                                      device=inputs.device)
-            else:
-                task = sum(
-                    v for k, v in losses.items()
-                    if isinstance(v, torch.Tensor) and "loss" in k
-                )
-                gx = torch.autograd.grad(task, inputs, retain_graph=True)[0]     # ∂L_seg/∂x
-                heatmap = gx.abs().mean(dim=1, keepdim=True)                     # [B,1,512,512]
-                heatmap = F.adaptive_avg_pool2d(heatmap, self.image_size)        # [B,1,128,128]
+            task = sum(
+                v for k, v in losses.items()
+                if isinstance(v, torch.Tensor) and "loss" in k
+            )
+            gx = torch.autograd.grad(task, inputs, retain_graph=True)[0]     # ∂L_seg/∂x
+            heatmap = gx.abs().mean(dim=1, keepdim=True)                     # [B,1,512,512]
+            heatmap = F.adaptive_avg_pool2d(heatmap, self.image_size)        # [B,1,128,128]
             mask = self.mask_selector.select(heatmap)
 
         # 3) DiffAE 分支：z_sem = head_feat 的全局池化——seg loss 与 diff loss

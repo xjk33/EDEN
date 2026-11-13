@@ -232,16 +232,15 @@ class DDIMSampler:
     def training_losses(
         self, model: nn.Module, x_start: torch.Tensor,
         model_kwargs: Optional[Dict] = None,
-        post_mask: Optional[torch.Tensor] = None,   # v2：加噪后再蒙（蒙区输入为 0）
-        target_override: Optional[torch.Tensor] = None,  # 软蒙：输入是混合图，目标仍是原始干净图
+        target_override: Optional[torch.Tensor] = None,  # 掩码：输入是替换退化图，目标仍是原始干净图
         t_probs: Optional[torch.Tensor] = None,     # t 采样分布（use_timesteps 上的概率）；None = 均匀
         t_override: Optional[torch.Tensor] = None,  # 外部直接给定的 t [B]（如 ANTS 采样器）；优先级最高
     ) -> Dict[str, Any]:
         """
         训练损失。返回 loss / noise / x_t / t / pred。
         predict_x0=False 时 pred = ε̂；predict_x0=True 时 pred = x̂0（loss 目标）。
-        post_mask 给定（v2 空间蒙块）：完整 x_t 加噪后再乘 mask，蒙区输入为 0，
-        目标仍是完整 x_start —— 蒙区唯一信息源是 cond（z_sem）。
+        掩码走替换型退化：x_start 已是 x̃₀（蒙区替换为均值色），target_override
+        传原始干净图——蒙区唯一信息源是 cond（z_sem）。
         """
         B = x_start.shape[0]
         device = x_start.device
@@ -270,12 +269,10 @@ class DDIMSampler:
 
         noise = torch.randn_like(x_start)
         x_t = self.q_sample(x_start, t, noise)
-        if post_mask is not None:
-            x_t = x_t * post_mask          # v2：先加噪后蒙，蒙区内容与噪声同时归零
         model_output = model(x_t, t, **(model_kwargs or {}))
 
-        # predict_x0=True 时目标是干净图 x0（v2），否则是噪声 ε（v1）。
-        # 软蒙时输入是混合图、目标用 target_override 传原始干净图（蒙区内容只能靠 z_sem）。
+        # predict_x0=True 时目标是干净图 x0，否则是噪声 ε。
+        # 掩码时输入是替换退化图、目标用 target_override 传原始干净图（蒙区内容只能靠 z_sem）。
         target = target_override if target_override is not None else \
             (x_start if self.predict_x0 else noise)
         loss = nn.functional.mse_loss(model_output, target, reduction="none")

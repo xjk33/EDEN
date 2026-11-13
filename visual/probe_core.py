@@ -7,17 +7,16 @@
   - 每个 ipynb 只做三件事：build_model / build_val_batch -> 调本文件的 measure_* -> 调 plot_*。
   - 在 mmsegmentation 环境下运行（需要 mmseg/mmengine 建模型与 dataloader）。
 
-包含五组能力：
+包含四组能力：
   1. ut 谱 + meta-gradient 金标准（ut 价值判据：两者相关性越高 ut 越可信），
      含测量缓存（npz）与论文拼图（n_ckpts × n_k 网格）
-  2. t_weight / d_table 快照与跨 ckpt 演化（t 自适应学到了什么）
-  3. 重建可视化（z_sem 复活判据）
-  4. 蒙块选址可视化（结构化噪声蒙的位置与剂量）
-  5. 固定 t 的 loss 方差分解（大 t 抖动：测量噪声 vs 任务本质不稳定）
+  2. t_weight / mu_table 快照与跨 ckpt 演化（t 自适应学到了什么）
+  3. 掩码选址可视化（任务引导结构化掩码的位置与剂量）
+  4. 固定 t 的 loss 方差分解（大 t 抖动：测量噪声 vs 任务本质不稳定）
 
 注意：旧 checkpoint 的 t 自适应 buffer 键名（顶层 t_weight/d_table/...）在重构后
 变为 t_adaptive.probe.*/t_adaptive.scheduler.*，strict=False 加载即可——
-Dt 谱、meta-grad、重建不受影响（只依赖网络权重）；旧 ckpt 的 t_weight 快照
+ut 谱、meta-grad 不受影响（只依赖网络权重）；旧 ckpt 的 t_weight 快照
 会显示为初始均匀值。
 """
 import os
@@ -33,8 +32,25 @@ IMAGENET_STD = [58.395, 57.12, 57.375]
 # =====================================================================
 # 建模与取数
 # =====================================================================
+# 旧 run dump 的 config 里可能带已退役的机制键（旧 t_weight 控制器 / 旧蒙块
+# 采样），新代码已不认。这些键只控制训练期的 t 采样与蒙块选址，不影响网络
+# 结构与权重——建模前剔除，旧 ckpt 即可照常测量（ut/meta/loss_var/mask 的
+# 测量都不经过这些机制）。
+LEGACY_MODEL_KEYS = (
+    't_weight_apply', 't_weight_pos_only', 't_weight_joint', 't_weight_p_min',
+    't_weight_p_max', 't_weight_eta', 't_weight_eps', 't_weight_z_cap',
+    't_weight_static_window',
+    'diffae_mask_ratio', 'diffae_mask_mode', 'diffae_mask_temp',
+    'diffae_mask_soft', 'diffae_mask_alpha', 'diffae_mask_dynamic',
+    'diffae_mask_ratio_max',
+)
+# 旧 adapter 类名 -> 现名（PCGrad 变体已合并/退役，权重布局与现类一致）
+LEGACY_MODEL_TYPES = {'FCNWithDiffAEPlusPCGrad': 'FCNWithDiffAE'}
+
+
 def build_model(cfg_path, ckpt=None, device=None, cfg_overrides=None):
-    """从 config 建模型（可选加载 checkpoint）。strict=False 兼容旧 ckpt 键名。
+    """从 config 建模型（可选加载 checkpoint）。strict=False 兼容旧 ckpt 键名；
+    旧 dump config 的退役机制键自动剔除（见 LEGACY_MODEL_KEYS）。
 
     cfg_overrides: dict，建模前 merge 进 cfg.model——用于让旧 ckpt 的仪器结构
     与当前代码默认对齐（如 UNet 时代的 run 需 dict(denoiser_type='unet')，
@@ -45,6 +61,14 @@ def build_model(cfg_path, ckpt=None, device=None, cfg_overrides=None):
     from mmseg.registry import MODELS
 
     cfg = Config.fromfile(cfg_path)
+    dropped = [k for k in LEGACY_MODEL_KEYS if k in cfg.model]
+    for k in dropped:
+        cfg.model.pop(k)
+    if cfg.model.get('type') in LEGACY_MODEL_TYPES:
+        cfg.model.type = LEGACY_MODEL_TYPES[cfg.model.type]
+        dropped.append('type->' + cfg.model.type)
+    if dropped:
+        print(f'[build_model] 旧 config 兼容：剔除/改写 {dropped}')
     if cfg_overrides:
         cfg.merge_from_dict({'model': cfg_overrides})
     init_default_scope('mmseg')
@@ -458,14 +482,14 @@ def ut_meta_correlation(ut, mg, keys=UT_KEYS, n_boot=1000, seed=0):
 # 测量 3：t_weight 快照（从 ckpt buffer 读，无需任何前向）
 # =====================================================================
 def read_tweight_snapshot(model):
-    """从当前模型读 t 自适应状态。Returns: dict —— t_weight / d_table / rep_t / logsnr / entropy"""
+    """从当前模型读 t 自适应状态。Returns: dict —— t_weight / mu_table / rep_t / logsnr / entropy"""
     w = model.t_weight.detach().float().cpu().numpy()
-    d = model.d_table.detach().float().cpu().numpy()
+    d = model.mu_table.detach().float().cpu().numpy()
     rep_t = model.bin_rep_t.detach().cpu().numpy().astype(int)
     ab = model.sampler.alphas_cumprod.detach().float().cpu().numpy()
     logsnr = np.log(ab / (1.0 - ab))[rep_t]
     ent = float(-(w * np.log(np.clip(w, 1e-12, None))).sum() / np.log(len(w)))
-    return {'t_weight': w, 'd_table': d, 'rep_t': rep_t, 'logsnr': logsnr,
+    return {'t_weight': w, 'mu_table': d, 'rep_t': rep_t, 'logsnr': logsnr,
             'entropy': ent}
 
 
@@ -504,9 +528,7 @@ def measure_mask_selection(model, batch, num_images=4):
     img = torch.cat(imgs, 0)
     heat_n = heat / heat.flatten(1).max(dim=1).values.view(-1, 1, 1, 1).clamp_min(1e-8)
     with torch.no_grad():
-        keep = model.mask_selector.select(heat)          # 0/1 keep-mask
-    if model.mask_applier.soft:                          # 软蒙：蒙块处保留 1-alpha
-        keep = 1.0 - model.mask_applier.alpha * (1.0 - keep)
+        keep = model.mask_selector.select(heat, guided=True)   # 0/1 keep-mask（强制引导模式）
     return {'img': img, 'heat': heat_n, 'keep': keep}
 
 
@@ -565,7 +587,7 @@ def measure_loss_variance(model, batch, n_t=32, n_eps_a=32, n_noise_b=8,
                     d_mean,d_std,d_cv,d_snr,
                     gap_mean,gap_std,gap_cv,gap_snr} 各 [n_t]
         d  = L(zero) − L(z_sem)（loss 差形式，原生参数化空间，无 eps 增益）；
-        gap = ‖p_z − p_c‖²（预测差形式，x0 模式下在线 d_table 实际喂控制器的量）。
+        gap = ‖p_z − p_c‖²（预测差形式，诊断对照用）。
         A/B 的 std 为组内均值的平方根（纯噪声 / 纯数据成分）；C 为全样本池化。
       arm_c 另有 corr_l0_lz [n_t]（两分支配对相关，>0.9 说明共享 x_t 主导）
       decomp: {var_a, var_b, var_c, interaction} [n_t]
@@ -604,7 +626,7 @@ def measure_loss_variance(model, batch, n_t=32, n_eps_a=32, n_noise_b=8,
         l_c/l_z —— 网络原生参数化空间的 loss（predict_x0 时目标是 x，否则是 ε），
             即训练 loss 实际所在的空间；D = l_z − l_c 是"loss 差"形式的 Dt。
         gap —— ‖p_z − p_c‖²，"预测差"形式的 Dt：x0 模式下在线控制器的
-            d_table 实际喂的就是它（t_adaptive.py DtProbe.measure），
+            在线探针吃的是 loss 差形式（t_adaptive.py UtProbe.measure），
             与 loss 差形式并存测量，两种口径的 CV/SNR 都能看。"""
         t = torch.full((x.shape[0],), int(t_val), device=device, dtype=torch.long)
         x_t = sampler.q_sample(x, t, noise)
@@ -995,9 +1017,9 @@ def plot_ut_montage(panels, ks, x_axis='logsnr', with_meta=True,
 
 
 def plot_tweight(snap, title='', ts_freq=None, save_path=None):
-    """t_weight 柱状 + D 表折线（+ 可选实际采样频率），双面板：t / logSNR。"""
+    """t_weight 柱状 + μ̄ 表折线（+ 可选实际采样频率），双面板：t / logSNR。"""
     plt = _plt()
-    w, d, rep_t, logsnr = snap['t_weight'], snap['d_table'], snap['rep_t'], snap['logsnr']
+    w, d, rep_t, logsnr = snap['t_weight'], snap['mu_table'], snap['rep_t'], snap['logsnr']
     K = len(w)
     fig, axes = plt.subplots(1, 2, figsize=(13, 4.4))
     d_n = d / np.abs(d).max() * w.max() if np.abs(d).max() > 0 else d
@@ -1005,7 +1027,7 @@ def plot_tweight(snap, title='', ts_freq=None, save_path=None):
                         (axes[1], logsnr, 'log SNR (bin rep)')]:
         ax.bar(x, w, width=(x[1] - x[0]) * 0.7 if K > 1 else 10,
                alpha=0.7, label='t_weight')
-        ax.plot(x, d_n, color='tab:red', marker='o', ms=3, label='D table (scaled)')
+        ax.plot(x, d_n, color='tab:red', marker='o', ms=3, label='μ̄ table (scaled)')
         if ts_freq is not None:
             ax.plot(x, ts_freq, color='tab:green', marker='s', ms=3, lw=1.8,
                     label='realized t freq')
@@ -1077,15 +1099,6 @@ def plot_mask_selection(sel, title='', save_path=None):
     return fig
 
 
-def save_recon(model, batch, save_path, max_samples=4):
-    """重建四列对比（原图 | 反演 | 重建 | 仅 z_sem 生成），走 mixin 接口。"""
-    os.makedirs(os.path.dirname(save_path), exist_ok=True)
-    model.save_diffae_visualization(
-        batch['x_diffae'], save_path,
-        max_samples=max_samples, cond=batch['cond'])
-    return save_path
-
-
 ARM_LABELS = {'arm_a': 'A: 仅 ε 随机', 'arm_b': 'B: 仅 x₀ 随机',
               'arm_c': 'C: 皆随机(总)'}
 ARM_COLORS = {'arm_a': 'tab:orange', 'arm_b': 'tab:green', 'arm_c': 'tab:blue'}
@@ -1149,7 +1162,7 @@ def plot_loss_variance(res, title='', save_path=None):
         ax.plot(t, np.abs(res[arm]['d_snr']), color=ARM_COLORS[arm], lw=2,
                 label=ARM_LABELS[arm])
     ax.plot(t, np.abs(c['gap_snr']), color='tab:red', lw=1.5, ls=':',
-            label='SNR(gap=‖p_z−p_c‖²) [C]（在线 d_table 口径）')
+            label='SNR(gap=‖p_z−p_c‖²) [C]（预测差诊断口径）')
     ax.axhline(1.0, color='k', ls='--', lw=1, label='|SNR|=1（信号=噪声）')
     ax.set_title('|SNR(D)| = |mean(D)|/std(D)——控制器实际吃到的信噪比', fontsize=10)
     ax.set_xlabel('t'); ax.set_ylabel('|SNR(D)|')

@@ -47,10 +47,9 @@ model = dict(
     ema_decay=0.9999,
     lambda_diff=1.0,
     auto_ema=True,
-    # ---- x0 预测、蒙块关、t 自适应关 ----
+    # ---- x0 预测、掩码关、t 自适应关 ----
     diffae_pred_x0=True,
-    diffae_mask_ratio=0.0,
-    diffae_mask_dynamic=False,
+    diffae_mask_enabled=False,
     t_weight_enabled=False,
 )
 
