@@ -8,7 +8,8 @@
   - 在 mmsegmentation 环境下运行（需要 mmseg/mmengine 建模型与 dataloader）。
 
 包含五组能力：
-  1. Dt 谱 + meta-gradient 金标准（Dt 价值判据：两者相关性越高 Dt 越可信）
+  1. ut 谱 + meta-gradient 金标准（ut 价值判据：两者相关性越高 ut 越可信），
+     含测量缓存（npz）与论文拼图（n_ckpts × n_k 网格）
   2. t_weight / d_table 快照与跨 ckpt 演化（t 自适应学到了什么）
   3. 重建可视化（z_sem 复活判据）
   4. 蒙块选址可视化（结构化噪声蒙的位置与剂量）
@@ -169,10 +170,23 @@ def pearson(x, y):
 
 
 # =====================================================================
-# 测量 1：Dt 谱（CRN + 多噪声重复版）
+# 测量 1：ut 谱（CRN + 多噪声重复版）
 # =====================================================================
+UT_KS = (0.0, 1.0, 2.0, 3.0)          # 定稿扫描档：k ∈ {0, 1, 2, 3}
+
+
+def ut_key(k):
+    """k 值 -> 结果字典键（0 -> 'ut0'，0.5 -> 'ut0_5'）。"""
+    return ('ut%g' % k).replace('.', '_')
+
+
+def ut_curve(ut, k):
+    """从测量返回的原始统计量现算任意 k 的 μ(t) 曲线——拼图换 k 不必重测。"""
+    return (ut['dm'] - k * ut['ds']) / (ut['l0m'] + ut['delta'])
+
+
 @torch.no_grad()
-def measure_dt_spectrum(model, batch, n_noise=8, seed=0):
+def measure_ut_spectrum(model, batch, n_noise=8, seed=0):
     """
     Dt 谱。可靠性设计（目标：估计噪声不再污染曲线形状与跨 ckpt 比较）：
       - cond 由当前 ckpt 的 encoder 现算（训练同分布；batch['cond'] 是建数时
@@ -184,21 +198,20 @@ def measure_dt_spectrum(model, batch, n_noise=8, seed=0):
         图像集固定是为跨 ckpt 可比付出的有意取舍；
       - 噪声流与 meta-grad 轴相互独立（各自专用种子），避免共享噪声伪造相关。
 
-    Dt 定稿形式（风险调整后的相对贡献；x0 预测，L = ‖pred−x‖²，
+    ut 定稿形式（风险调整后的相对贡献；x0 预测，L = ‖pred−x‖²，
     每 t 有 n_noise×B 个配对样本，D = L0−Lz）：
-        u(t) = (D̄(t) − κ·σ(t)) / (L̄₀(t) + δ)
-      分子（减法）管存亡：σ 大到把 D̄ 扣穿零的 t 被压制（不可复现的贡献
-      不算数）；D̄ 与 σ 同量纲（都是 loss），减法合法。
+        μ(t) = (D̄(t) − k·σ_D(t)) / (L̄₀(t) + δ)
+      分子（减法）管存亡：σ_D 大到把 D̄ 扣穿零的 t 被压制（不可复现的贡献
+      不算数）；D̄ 与 σ_D 同量纲（都是 loss），减法合法。
       分母（除法）管排序：除以无条件难度 L̄₀，存活 t 按"占无条件难度的
       比例"排剂量，跨 t/跨任务可比；除以正数不改变符号。
-      小 t 处 D̄、σ 都→0，u 自动趋零，无需人工压制。
+      小 t 处 D̄、σ_D 都→0，μ 自动趋零，无需人工压制。
       δ = 0.1 × median(L̄₀)（全 t 中位数的 1/10，纯数值保险，不承担语义）。
-    两个 σ 变体（主版 + 对照）：
-      u{κ}  —— σ = std(L0)：无条件难度的散布（主版）
-      ud{κ} —— σ = std(D)：贡献本身的散布（对照版）
-    κ ∈ {0, 0.5, 1, 2} 四档扫描；κ=0 时 u ≈ drel（退化基准）。
-    另在返回中保留 dabs/drel/deff/dx0（旧口径，不进裁判图）。
-    Returns: dict —— t/logsnr/8 个 u 键 + 4 个旧口径键 [T]；
+      σ 取贡献本身的散布 std(D)；k ∈ {0, 1, 2, 3} 四档扫描，
+      k=0 时 μ ≈ drel（退化基准）。
+    返回原始统计量（dm/ds/l0m/delta），任意 k 的 μ 曲线由 ut_curve() 现算，
+    拼图换 k 不必重测；另按 UT_KS 预存 4 条 ut 键供相关性裁判直接用。
+    Returns: dict —— t/logsnr/dm/ds/l0m/l0s/lzm/delta + 4 个 ut 键 [T]；
       per_image_d [T,B]（图级分析用）
     """
     unet, sampler = model.diffae_unet, model.sampler
@@ -221,7 +234,6 @@ def measure_dt_spectrum(model, batch, n_noise=8, seed=0):
 
     L0 = np.zeros((T, n_noise, B))
     LZ = np.zeros((T, n_noise, B))
-    GAP = np.zeros((T, n_noise, B))
 
     for ti, t_val in enumerate(ts):
         t = torch.full((B,), int(t_val), device=device, dtype=torch.long)
@@ -231,7 +243,6 @@ def measure_dt_spectrum(model, batch, n_noise=8, seed=0):
             p_z = unet(x_t, t, torch.zeros_like(cond))
             L0[ti, j] = (p_z - x).pow(2).flatten(1).mean(1).cpu().numpy()
             LZ[ti, j] = (p_c - x).pow(2).flatten(1).mean(1).cpu().numpy()
-            GAP[ti, j] = (p_z - p_c).pow(2).flatten(1).mean(1).cpu().numpy()
 
     d = L0 - LZ                                    # [T, R, B]
     l0m = L0.mean(axis=(1, 2))
@@ -239,19 +250,12 @@ def measure_dt_spectrum(model, batch, n_noise=8, seed=0):
     l0s = L0.reshape(T, -1).std(axis=1, ddof=1)
     dm = d.mean(axis=(1, 2))
     ds = d.reshape(T, -1).std(axis=1, ddof=1)
-    # 定稿形式 u(t) = (D̄ − κ·σ)/(L̄₀ + δ)，δ = 0.1 × median(L̄₀)（数值保险）
+    # 定稿形式 μ(t) = (D̄ − k·σ_D)/(L̄₀ + δ)，δ = 0.1 × median(L̄₀)（数值保险）
     delta = 0.1 * float(np.median(l0m))
-    out = {}
-    for k, tag in ((0.0, '0'), (0.5, '05'), (1.0, '1'), (2.0, '2')):
-        out[f'u{tag}'] = (dm - k * l0s) / (l0m + delta)   # 主版：σ = std(L0)
-        out[f'ud{tag}'] = (dm - k * ds) / (l0m + delta)   # 对照：σ = std(D)
-    # 旧口径保留（不进裁判图）
-    out.update({
-        'dabs': dm,
-        'drel': 1.0 - lzm / np.maximum(l0m, 1e-12),
-        'deff': (l0m - lzm) / np.maximum(l0s, 1e-12),
-        'dx0': np.median(GAP.reshape(T, -1), axis=1),
-    })
+    out = {'dm': dm, 'ds': ds, 'l0m': l0m, 'l0s': l0s, 'lzm': lzm,
+           'delta': delta}
+    for k in UT_KS:
+        out[ut_key(k)] = (dm - k * ds) / (l0m + delta)
     ab = sampler.alphas_cumprod.detach().cpu().numpy()
     logsnr = np.log(ab / (1.0 - ab))[ts]
     return {'t': ts, 'logsnr': logsnr,
@@ -379,17 +383,13 @@ def measure_meta_grad_spectrum(model, batch, n_t=32, n_subsets=4, n_noise=2,
             'bin_edges': probe.bin_edges.detach().cpu().numpy()}
 
 
-# 参与可视化的 Dt 变体：定稿形式 u(t) = (D̄−κσ)/(L̄₀+δ)
-# 主版 σ=std(L0)（u 前缀）+ 对照版 σ=std(D)（ud 前缀），κ ∈ {0, 0.5, 1, 2}
-DT_KEYS = ('u0', 'u05', 'u1', 'u2', 'ud0', 'ud05', 'ud1', 'ud2')
-DT_LABELS = {'u0': 'u(κ=0, σ_L0)', 'u05': 'u(κ=0.5, σ_L0)',
-             'u1': 'u(κ=1, σ_L0)', 'u2': 'u(κ=2, σ_L0)',
-             'ud0': 'u(κ=0, σ_D)', 'ud05': 'u(κ=0.5, σ_D)',
-             'ud1': 'u(κ=1, σ_D)', 'ud2': 'u(κ=2, σ_D)'}
+# 参与可视化的 ut 变体：定稿形式 μ(t) = (D̄−k·σ_D)/(L̄₀+δ)，k ∈ {0, 1, 2, 3}
+UT_KEYS = tuple(ut_key(k) for k in UT_KS)
+UT_LABELS = {ut_key(k): f'μ(k={k:g})' for k in UT_KS}
 
 
-def dt_meta_correlation(dt, mg, keys=DT_KEYS, n_boot=1000, seed=0):
-    """Dt 各变体与 meta-grad 的 Spearman / Pearson。
+def ut_meta_correlation(ut, mg, keys=UT_KEYS, n_boot=1000, seed=0):
+    """ut 各 k 档与 meta-grad 的 Spearman / Pearson。
     三条路径按 mg 内容自动选择：
       - mg 含 meta_subsets（v3）：Dt 取 meta 网格上的对应点逐点相关，
         bootstrap 对**图像子集**重采样（每 t 重抽子集取均值再算 ρ）——
@@ -400,19 +400,19 @@ def dt_meta_correlation(dt, mg, keys=DT_KEYS, n_boot=1000, seed=0):
     Returns: {key: (rho_s, p_s, rho_p, (ci_lo, ci_hi))}"""
     rng = np.random.default_rng(seed)
     has_sub = 'meta_subsets' in mg
-    full = (not has_sub) and len(mg['meta']) == len(dt['t'])
+    full = (not has_sub) and len(mg['meta']) == len(ut['t'])
     edges = mg['bin_edges']
-    ls = dt['logsnr']
+    ls = ut['logsnr']
     K = len(edges) - 1
     out = {}
     for key in keys:
         if has_sub:
-            mask = np.isin(dt['t'], mg['t'])
-            x = dt[key][mask]
+            mask = np.isin(ut['t'], mg['t'])
+            x = ut[key][mask]
             subs = mg['meta_subsets']
             y = subs.mean(1)
         elif full:
-            x, y = dt[key], mg['meta']
+            x, y = ut[key], mg['meta']
         else:
             # 两侧各自按 bin_edges 归入 K 桶取均值，空桶退回最近点
             def _binned(vals, ls_side):
@@ -427,7 +427,7 @@ def dt_meta_correlation(dt, mg, keys=DT_KEYS, n_boot=1000, seed=0):
                             ls_side - 0.5 * (edges[i] + edges[i + 1]))))])
                 return np.array(out_v)
 
-            x = _binned(dt[key], ls)
+            x = _binned(ut[key], ls)
             y = _binned(mg['meta'], mg.get('logsnr', mg['rep_logsnr']))
         rho_s, p_s = spearman(x, y)
         rho_p = pearson(x, y)
@@ -830,12 +830,12 @@ def _plt():
     return plt
 
 
-def plot_dt_vs_meta(dt, mg=None, title='', save_path=None, keys=DT_KEYS):
-    """Dt 谱（deps/dx0/cos 三变体 × t/logSNR 两视图）+ meta-grad 谱（红，桶代表 t）
-    双 y 轴合图，每行左图标注该变体与 meta-grad 的相关系数。
-    Returns: (fig, {key: (rho_s, p_s, rho_p)})"""
+def plot_ut_vs_meta(ut, mg=None, title='', save_path=None, keys=UT_KEYS):
+    """ut 谱（k 四档 × t/logSNR 两视图）+ meta-grad 谱（红，桶代表 t）
+    双 y 轴合图，每行左图标注该 k 档与 meta-grad 的相关系数。
+    Returns: (fig, {key: (rho_s, p_s, rho_p, ci)})"""
     plt = _plt()
-    corrs = dt_meta_correlation(dt, mg, keys) if mg is not None else {}
+    corrs = ut_meta_correlation(ut, mg, keys) if mg is not None else {}
 
     fig, axes = plt.subplots(len(keys), 2, figsize=(13, 3.6 * len(keys)),
                              squeeze=False)
@@ -844,15 +844,15 @@ def plot_dt_vs_meta(dt, mg=None, title='', save_path=None, keys=DT_KEYS):
     x_mg_t = mg['t'] if mg_line else (mg['rep_t'] if mg else None)
     x_mg_ls = mg['logsnr'] if mg_line else (mg['rep_logsnr'] if mg else None)
     for row, key in enumerate(keys):
-        for col, (x_dt, x_mg, xlab) in enumerate([
-                (dt['t'], x_mg_t, 't'),
-                (dt['logsnr'], x_mg_ls, 'log SNR')]):
+        for col, (x_ut, x_mg, xlab) in enumerate([
+                (ut['t'], x_mg_t, 't'),
+                (ut['logsnr'], x_mg_ls, 'log SNR')]):
             ax = axes[row, col]
-            ax.plot(x_dt, dt[key], lw=2, color='tab:blue',
-                    label=f'{DT_LABELS[key]} (Dt)')
+            ax.plot(x_ut, ut[key], lw=2, color='tab:blue',
+                    label=f'{UT_LABELS[key]} (ut)')
             ax.axhline(0, color='k', ls='--', lw=0.8)
             ax.set_xlabel(xlab)
-            ax.set_ylabel(DT_LABELS[key], color='tab:blue')
+            ax.set_ylabel(UT_LABELS[key], color='tab:blue')
             ax.grid(alpha=0.3)
             if mg is not None:
                 ax2 = ax.twinx()
@@ -876,7 +876,7 @@ def plot_dt_vs_meta(dt, mg=None, title='', save_path=None, keys=DT_KEYS):
             if mg is not None and col == 0:
                 rho_s, p_s, rho_p, ci = corrs[key]
                 ci_s = f' CI95[{ci[0]:.2f},{ci[1]:.2f}]' if np.isfinite(ci[0]) else ''
-                ax.set_title(f'{DT_LABELS[key]} ~ meta-grad: '
+                ax.set_title(f'{UT_LABELS[key]} ~ meta-grad: '
                              f'Spearman ρ={rho_s:.3f}{ci_s} (p={p_s:.3f}) | '
                              f'Pearson r={rho_p:.3f}', fontsize=10)
     fig.suptitle(title)
@@ -884,6 +884,114 @@ def plot_dt_vs_meta(dt, mg=None, title='', save_path=None, keys=DT_KEYS):
     if save_path:
         fig.savefig(save_path, dpi=150)
     return fig, corrs
+
+
+# =====================================================================
+# 测量缓存：ut / meta-grad 测量结果存 npz，拼图免重测
+# =====================================================================
+def save_probe_cache(path, ut, mg=None):
+    """把一次 (ut, mg) 测量存成 npz（np.savez 要求纯数组/标量）。"""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    arrs = {f'ut__{k}': v for k, v in ut.items()}
+    if mg is not None:
+        arrs.update({f'mg__{k}': v for k, v in mg.items()})
+    np.savez(path, **arrs)
+
+
+def load_probe_cache(path):
+    """读回 save_probe_cache 存的 npz。Returns: (ut, mg_or_None)。"""
+    z = np.load(path, allow_pickle=False)
+    ut, mg = {}, {}
+    for k in z.files:
+        if k.startswith('ut__'):
+            v = z[k]
+            ut[k[4:]] = float(v) if v.ndim == 0 else v
+        elif k.startswith('mg__'):
+            mg[k[4:]] = z[k]
+    return ut, (mg if mg else None)
+
+
+# =====================================================================
+# 论文拼图：挑 ckpt × 挑 k 值的 n_ckpts × n_k 网格图
+# =====================================================================
+def plot_ut_montage(panels, ks, x_axis='logsnr', with_meta=True,
+                    share_y=True, dpi=300, cell=(3.2, 2.5),
+                    title='', save_path=None):
+    """论文拼图：行 = checkpoint，列 = k 值，共 n_ckpts × n_k 个 cell。
+
+    每个 cell：μ(t) 蓝线（左轴）+ 可选 meta-grad 红线（右轴，跨子集误差带），
+    左上角标 Spearman ρ（有 meta 时）；行标题（左侧）= ckpt tag，
+    列标题（顶部）= k 值。share_y=True 时同列 μ 轴共享量程（跨 ckpt 可比）。
+
+    Args:
+        panels:  list of dict —— {'tag': str, 'ut': ut结果, 'mg': mg或None}
+                 （顺序即行顺序；mg=None 或 with_meta=False 时只画 μ 曲线）
+        ks:      列的 k 值列表（任意浮点，μ 由 ut_curve 现算，不限 UT_KS）
+        x_axis:  'logsnr'（默认，论文视图）或 't'
+    Returns: fig
+    """
+    plt = _plt()
+    n_r, n_c = len(panels), len(ks)
+    fig, axes = plt.subplots(n_r, n_c,
+                             figsize=(cell[0] * n_c, cell[1] * n_r),
+                             squeeze=False)
+    xlab = 'log SNR' if x_axis == 'logsnr' else 't'
+
+    # 同列共享 μ 量程（跨 ckpt 可比；含 0 线）
+    if share_y:
+        for ci, k in enumerate(ks):
+            lo, hi = 0.0, 0.0
+            for p in panels:
+                v = ut_curve(p['ut'], k)
+                lo, hi = min(lo, float(v.min())), max(hi, float(v.max()))
+            pad = 0.08 * max(hi - lo, 1e-12)
+            for ri in range(n_r):
+                axes[ri, ci].set_ylim(lo - pad, hi + pad)
+
+    for ri, p in enumerate(panels):
+        ut, mg = p['ut'], p.get('mg')
+        x_ut = ut['logsnr'] if x_axis == 'logsnr' else ut['t']
+        if with_meta and mg is not None:
+            # ks 不限于四档：先把任意 k 的 μ 曲线补进字典再算相关
+            u2 = dict(ut)
+            for k in ks:
+                u2[ut_key(k)] = ut_curve(ut, k)
+            corrs = ut_meta_correlation(u2, mg,
+                                        keys=[ut_key(k) for k in ks], n_boot=0)
+        else:
+            corrs = {}
+        for ci, k in enumerate(ks):
+            ax = axes[ri, ci]
+            y = ut_curve(ut, k)
+            ax.plot(x_ut, y, lw=1.8, color='tab:blue')
+            ax.axhline(0, color='k', ls='--', lw=0.7)
+            ax.grid(alpha=0.3)
+            ax.tick_params(labelsize=8)
+            if with_meta and mg is not None:
+                x_mg = mg['logsnr'] if x_axis == 'logsnr' else mg.get(
+                    't', mg.get('rep_t'))
+                ax2 = ax.twinx()
+                ax2.plot(x_mg, mg['meta'], lw=1.4, color='tab:red', alpha=0.85)
+                if 'meta_std' in mg:
+                    ax2.fill_between(x_mg, mg['meta'] - mg['meta_std'],
+                                     mg['meta'] + mg['meta_std'],
+                                     color='tab:red', alpha=0.15)
+                ax2.tick_params(labelsize=7, colors='tab:red')
+                rho_s = corrs[ut_key(k)][0]
+                ax.text(0.03, 0.95, f'ρ={rho_s:.2f}', transform=ax.transAxes,
+                        fontsize=8, va='top', color='dimgray')
+            if ri == 0:
+                ax.set_title(f'k={k:g}', fontsize=11)
+            if ci == 0:
+                ax.set_ylabel(f"{p['tag']}\nμ(t)", fontsize=9)
+            if ri == n_r - 1:
+                ax.set_xlabel(xlab, fontsize=9)
+    if title:
+        fig.suptitle(title)
+    fig.tight_layout()
+    if save_path:
+        fig.savefig(save_path, dpi=dpi, bbox_inches='tight')
+    return fig
 
 
 def plot_tweight(snap, title='', ts_freq=None, save_path=None):

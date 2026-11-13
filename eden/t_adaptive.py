@@ -10,12 +10,13 @@ TAdaptive 把两者组合为一个 nn.Module（buffer 随 checkpoint 保存）�
 全部超参数在它的 __init__ 里集中初始化；DiffAEMixin 只持有一个实例，
 不再自己管理 t 加权的任何细节。
 
-方法学映射（全部为教科书算法，无自造成分）：
-  - 臂(arm)  = logSNR 桶（按模型训练网格等频划分）
-  - 每臂收益 = 探针测得的 per-桶 D = median(L(zero) - L(z_sem))，配对同图同噪声
-  - 权重更新 = 指数加权 / Hedge（Freund & Schapire 1997），对抗版本即 EXP3（Auer et al. 2002）
-  - 探索项   = eps-均匀混合（EXP3 标准做法，保证任何桶权重不为 0）
-  - 非平稳   = 收益 EMA（折扣 EXP3 的工程近似，Garivier & Moulines 2008 一族）
+方法学映射：
+  - 臂(arm)  = logSNR 区间（按模型训练网格等频划分）
+  - 每臂收益 = 贡献度 μ = (E[D] − k·σ_D) / (E[L_0] + δ)，D = L(zero) − L(z_sem)
+    （配对同图同噪声；期望/方差由在线 EMA 矩累积估计，见 DtProbe）
+  - 非平稳   = 收益 EMA（动量平滑在探针侧完成，权重侧不再叠加滤波）
+  - 权重更新 = 取正部 + 归一化 + [p_min, p_max] 防坍缩截断（简化控制器）
+  - 探索项   = p_min 探索地板（任何区间概率不为 0，"复活"可观测）
   - 预热     = 前 warmup_iters 步只累计收益，权重保持均匀
 """
 import numpy as np
@@ -28,9 +29,13 @@ from .sampler import get_named_beta_schedule
 
 class DtProbe(nn.Module):
     """
-    Dt 计算：把训练网格按 logSNR 等频分桶，轮换探针测量每桶的
-    D = median( L(cond=0) - L(z_sem) )（同图、同噪声、同 t，配对），
-    结果 EMA 进收益表。只负责"测"，不负责"用"。
+    Dt / μt 计算：把训练网格按 logSNR 等频分桶，轮换探针测量每桶的逐样本配对
+    D = L(cond=0) - L(z_sem) 与 L_0 = L(cond=0)（同图、同噪声、同 t），
+    在线 EMA 累积 D 的一阶/二阶矩与 L_0 均值，合成贡献度
+        μ = (E[D] − k·σ_D) / (E[L_0] + δ)   （σ_D = sqrt(max(E[D²]−E[D]², 0))）
+    均值/方差由在线矩累积估计，无需单次大批量；离群值的影响由 k·σ_D 项显式承担
+    （因此逐轮聚合用均值——E[D] 的无偏估计——而非旧版的中位数）。
+    只负责"测"，不负责"用"。
     """
 
     def __init__(
@@ -42,12 +47,16 @@ class DtProbe(nn.Module):
         interval: int = 500,          # 每多少训练步测一轮
         ema: float = 0.95,            # 收益 EMA 系数（非平稳折扣近似）
         probe_batch: int = 16,        # 每轮探针最多用多少样本
+        k: float = 1.0,               # 不确定性惩罚系数（μ 分子 D − k·σ_D）
+        delta: float = 1e-3,          # 量纲归一保护常数（μ 分母 E[L_0] + δ）
     ):
         super().__init__()
         self.num_bins = num_bins
         self.interval = interval
         self.ema = ema
         self.probe_batch = probe_batch
+        self.k = k
+        self.delta = delta
         self._probe_step = 0          # 已见的训练步数（预热计时用）
 
         # ---- logSNR 分桶：在【训练网格】上按 logSNR 等频划分 ----
@@ -66,7 +75,10 @@ class DtProbe(nn.Module):
         self.register_buffer('logsnr_per_t', torch.from_numpy(logsnr))
         self.register_buffer('bin_edges', torch.from_numpy(edges))
         self.register_buffer('bin_rep_t', torch.from_numpy(rep_t.astype(np.int64)))
-        self.register_buffer('d_table', torch.zeros(num_bins))       # 主收益表（x0/eps 视参数化而定）
+        self.register_buffer('d_table', torch.zeros(num_bins))       # E[D] 的 EMA（一阶矩）
+        self.register_buffer('d_sq_table', torch.zeros(num_bins))    # E[D²] 的 EMA（二阶矩，算 σ_D）
+        self.register_buffer('l0_table', torch.zeros(num_bins))      # E[L_0] 的 EMA（量纲归一分母）
+        self.register_buffer('mu_table', torch.zeros(num_bins))      # 贡献度 μ（Hedge 的收益表）
         self.register_buffer('d_eps_table', torch.zeros(num_bins))   # 诊断：epsilon 空间 D
         self.register_buffer('d_cos_table', torch.zeros(num_bins))   # joint：cos 计分（增益不变）
         self.register_buffer('d_count', torch.zeros(num_bins))
@@ -82,8 +94,9 @@ class DtProbe(nn.Module):
     def measure(self, unet: nn.Module, sampler, x_start: torch.Tensor,
                 cond: torch.Tensor, joint: bool = False) -> bool:
         """
-        轮换探针：到点（每 interval 步）就对每个桶的代表 t 测一轮配对 D，
-        EMA 进收益表。返回本轮是否实际测量。
+        轮换探针：到点（每 interval 步）就对每个桶的代表 t 测一轮逐样本配对
+        D 与 L_0（同图、同噪声、同 t），把 batch 均值的 D / D² / L_0 EMA 进
+        在线矩表，并刷新贡献度 μ。返回本轮是否实际测量。
         """
         self._probe_step += 1
         if self._probe_step % self.interval != 0:
@@ -98,7 +111,9 @@ class DtProbe(nn.Module):
         was_training = unet.training
         unet.eval()
 
-        d_new = torch.zeros(K, device=dev)
+        d_mean_new = torch.zeros(K, device=dev)
+        d_sq_new = torch.zeros(K, device=dev)
+        l0_new = torch.zeros(K, device=dev)
         d_eps_new = torch.zeros(K, device=dev)
         d_cos_new = torch.zeros(K, device=dev)   # cos 计分（joint）
         for bi in range(K):
@@ -107,12 +122,19 @@ class DtProbe(nn.Module):
             x_t = sampler.q_sample(x, t, noise)
             p_c = unet(x_t, t, c)
             p_z = unet(x_t, t, torch.zeros_like(c))
+            # 逐样本配对损失差：D_i = L_0,i − L_z,i（loss 目标随参数化而定）
             if sampler.predict_x0:
-                # x0 模式：pred 即 x̂0。同一次前向读出两种 D：
-                #   d_x0 = cond 对重建的影响（直接、有界）
-                #   d_eps = 换算到 epsilon 空间（固定公式，含 1/√(1-ᾱ) 增益 -> 天然偏置低 t）
-                d_x0 = (p_z - p_c).pow(2).flatten(1).mean(1)
-                d_new[bi] = d_x0.median()
+                l_c = (p_c - x).pow(2).flatten(1).mean(1)
+                l_z = (p_z - x).pow(2).flatten(1).mean(1)
+            else:
+                l_c = (p_c - noise).pow(2).flatten(1).mean(1)
+                l_z = (p_z - noise).pow(2).flatten(1).mean(1)
+            d_i = l_z - l_c
+            d_mean_new[bi] = d_i.mean()
+            d_sq_new[bi] = d_i.pow(2).mean()
+            l0_new[bi] = l_z.mean()
+            # 诊断：换算到 epsilon 空间的 D（含 1/√(1-ᾱ) 增益 -> 天然偏置低 t）
+            if sampler.predict_x0:
                 ac_b = float(sampler.alphas_cumprod[int(self.bin_rep_t[bi])])
                 sq_a, sq_1a = ac_b ** 0.5, (1.0 - ac_b) ** 0.5
                 eps_c = (x_t - sq_a * p_c) / sq_1a
@@ -120,18 +142,7 @@ class DtProbe(nn.Module):
                 d_eps = (eps_z - noise).pow(2).flatten(1).mean(1) - (eps_c - noise).pow(2).flatten(1).mean(1)
                 d_eps_new[bi] = d_eps.median()
             else:
-                l_c = (p_c - noise).pow(2).flatten(1).mean(1)
-                l_z = (p_z - noise).pow(2).flatten(1).mean(1)
-                d_med = (l_z - l_c).median()   # 中位数抗离群
-                d_eps_new[bi] = d_med
-                d_new[bi] = d_med              # 非 joint 时 d_table 就是 deps（原行为）
-                if joint:
-                    # joint 时 d_table 改用换算到 x̂0 空间的读数（cos 计分的伴生诊断）
-                    ac_b = float(sampler.alphas_cumprod[int(self.bin_rep_t[bi])])
-                    sq_a, sq_1a = ac_b ** 0.5, (1.0 - ac_b) ** 0.5
-                    x0_c = (x_t - sq_1a * p_c) / sq_a
-                    x0_z = (x_t - sq_1a * p_z) / sq_a
-                    d_new[bi] = (x0_z - x0_c).pow(2).flatten(1).mean(1).median()
+                d_eps_new[bi] = d_i.median()   # eps 模式下主量与诊断同源，保留中位数抗离群
             if joint:
                 # 1 - cos(ε̂_cond, ε̂_zero)：仿射不变 => 与参数化(ε/x0)无关；
                 # 尺度不变 => 免疫两种增益爆炸；语义 = z_sem 对预测方向的相对影响
@@ -143,20 +154,29 @@ class DtProbe(nn.Module):
         if was_training:
             unet.train()
 
-        # 收益 EMA（非平稳折扣近似）
+        # 在线矩 EMA（非平稳折扣近似）：期望/方差跨轮累积，无需单次大批量
         m = self.ema
-        self.d_table.mul_(m).add_(d_new, alpha=1.0 - m)
+        self.d_table.mul_(m).add_(d_mean_new, alpha=1.0 - m)
+        self.d_sq_table.mul_(m).add_(d_sq_new, alpha=1.0 - m)
+        self.l0_table.mul_(m).add_(l0_new, alpha=1.0 - m)
         self.d_eps_table.mul_(m).add_(d_eps_new, alpha=1.0 - m)
         self.d_cos_table.mul_(m).add_(d_cos_new, alpha=1.0 - m)
         self.d_count.add_(1.0)
+
+        # 贡献度 μ = (E[D] − k·σ_D) / (E[L_0] + δ)，σ_D 由在线二阶矩给出
+        var = (self.d_sq_table - self.d_table.pow(2)).clamp_min(0.0)
+        self.mu_table.copy_(
+            (self.d_table - self.k * var.sqrt()) / (self.l0_table + self.delta))
         return True
 
 
 class TWeightScheduler(nn.Module):
     """
-    从 Dt 收益表得到 t 权重 wt（Hedge/EXP3），并提供两种应用方式：
-      apply='sample' —— 桶权重映射回训练网格，作为 t 的采样分布（每步满强度）
-      apply='loss'   —— 按桶加权扩散 loss（期望等价，有限 batch 下强度不均）
+    从贡献度收益表（mu_table）得到 t 权重 wt：动量平滑已在探针侧完成
+    （在线矩 EMA），权重侧只做三步——取正部、归一化、防坍缩截断。
+    提供两种应用方式：
+      apply='sample' —— 区间权重映射回训练网格，作为 t 的采样分布（每步满强度）
+      apply='loss'   —— 按区间加权扩散 loss（期望等价，有限 batch 下强度不均）
     只负责"用"，不负责"测"。
     """
 
@@ -164,25 +184,21 @@ class TWeightScheduler(nn.Module):
         self,
         num_bins: int = 16,
         warmup_iters: int = 5000,      # 预热期：只累计收益，权重保持均匀
-        eta: float = 2.0,              # Hedge 学习率（z-score 放大倍数）
-        eps: float = 0.1,              # 均匀探索混合比例
-        z_cap: float = 1.0,            # 标准化分数截断（防单桶劫持：cap=1 -> 单桶上限约 1/3）
-        domain: Optional[List[float]] = None,     # logSNR 定义域 [lo, hi]；域外桶恒压地板
-        pos_only: bool = False,        # True = 正值竞争（D<=0/域外一律地板）；False = 全局带符号 softmax
+        p_min: float = 0.005,          # 探索地板（每区间概率下界，防永久封杀）
+        p_max: float = 0.3,            # 防坍缩截断（每区间概率上界，防单区间劫持）
         joint: bool = False,           # True = 用 cos 计分（增益不变、天然中段峰）
         apply: str = 'loss',           # 'loss' | 'sample'
         static_window: Optional[List[int]] = None,  # 如 [100,500]：权重固定为窗内均匀，禁用动态更新
-        probe_rep_t: Optional[torch.Tensor] = None,  # 静态窗口初始化需要各桶代表 t
+        probe_rep_t: Optional[torch.Tensor] = None,  # 静态窗口初始化需要各区间代表 t
     ):
         super().__init__()
         assert apply in ('loss', 'sample'), f"unknown apply mode: {apply}"
+        assert 0.0 <= p_min < 1.0 / num_bins < p_max <= 1.0, \
+            f'需满足 0 <= p_min < 1/K < p_max <= 1，得到 p_min={p_min}, p_max={p_max}, K={num_bins}'
         self.num_bins = num_bins
         self.warmup_iters = warmup_iters
-        self.eta = eta
-        self.eps = eps
-        self.cap = z_cap
-        self.domain = domain
-        self.pos_only = pos_only
+        self.p_min = p_min
+        self.p_max = p_max
         self.joint = joint
         # 注意：不能命名为 self.apply——会覆盖 nn.Module.apply()，
         # 导致 model.to(device) / .apply(fn) 递归时 TypeError: 'str' object is not callable
@@ -191,67 +207,45 @@ class TWeightScheduler(nn.Module):
 
         self.register_buffer('t_weight', torch.full((num_bins,), 1.0 / num_bins))
 
-        # 静态窗口模式：权重固定为窗口内桶均分、窗口外地板（与 eps 均匀混合）
+        # 静态窗口模式：窗口内均分剩余概率、窗口外探索地板
         if static_window is not None:
             lo, hi = static_window
             in_win = (probe_rep_t >= lo) & (probe_rep_t <= hi)
             n_in = int(in_win.sum())
             if n_in == 0:
                 raise ValueError(
-                    f"t_weight_static_window [{lo}, {hi}] 内没有任何桶的代表 t "
+                    f"t_weight_static_window [{lo}, {hi}] 内没有任何区间的代表 t "
                     f"(rep_t 范围 [{probe_rep_t.min()}, {probe_rep_t.max()}])，请检查窗口设置。"
                 )
-            w = torch.full((num_bins,), eps / num_bins)
-            w[in_win] = (1.0 - eps) / n_in + eps / num_bins
+            w = torch.full((num_bins,), p_min)
+            w[in_win] += (1.0 - p_min * num_bins) / n_in
             self.t_weight.copy_(w)
 
     @torch.no_grad()
     def update(self, probe: DtProbe) -> None:
-        """预热结束且非静态窗口时，按 Hedge/EXP3 从收益表刷新权重。"""
+        """预热结束且非静态窗口时刷新权重：取正部 -> 归一化 -> 截断 -> 再归一化。"""
         if self.static_window is not None:
             return  # 静态窗口：权重在 __init__ 已固定，探针只记录
         if probe._probe_step < self.warmup_iters:
             return  # 预热期只累计收益
 
-        score = probe.d_cos_table if self.joint else probe.d_table
+        score = probe.d_cos_table if self.joint else probe.mu_table
         K = self.num_bins
-        cap = self.cap
 
-        # 参与竞争的桶 = 定义域内 且 score > 0（正值 = z_sem 对该 t 的去噪有正贡献）。
-        # 其余（负贡献、零贡献、域外）一律给 -cap：真抑制（拿探索地板），不靠符号运气。
-        ls_bin = probe.logsnr_per_t.to(score.device)[probe.bin_rep_t]   # 每桶代表 t 的 logSNR
-        inside = torch.ones(K, dtype=torch.bool, device=score.device)
-        if self.domain is not None:
-            lo, hi = self.domain
-            inside = (ls_bin >= lo) & (ls_bin <= hi)
-        if self.pos_only:
-            # 正值竞争 + 域外地板（升级路径；防低 t 劫持、防负值语义混杂）
-            # 有限性过滤：inf/NaN 桶不许参赛（inf>0 会 True，必须显式挡）
-            pos = inside & (score > 0) & torch.isfinite(score)
-            n_pos = int(pos.sum())
-            if n_pos == 0:
-                if not getattr(self, '_warned_flat', False):
-                    self._warned_flat = True
-                    print('[t_weight] WARNING: no positive bin (all D<=0 or outside domain), '
-                          'weights stay at floor.')
-                z = torch.zeros(K, device=score.device)
-            elif n_pos == 1:
-                # 单桶退化的保护：无偏 std 在 n=1 时是 NaN；独苗直接给满分，不做除法
-                z = torch.where(pos, torch.full_like(score, cap),
-                                torch.full_like(score, -cap))
-            else:
-                mu = score[pos].mean()
-                sd = score[pos].std(correction=0).clamp_min(1e-12)   # 有偏 std，n>=2 恒有限
-                z = torch.full_like(score, -cap)
-                z = torch.where(pos, self.eta * (score - mu) / sd, z)
+        # 取正部：贡献非正的区间不参与分配（μ<=0 = 该粒度去噪约束与特征脱耦甚至有害）。
+        # 它们仍由 p_min 的探索地板偶尔采到——训练漂移使其"复活"时可被重新观测。
+        w = torch.where(torch.isfinite(score), score, torch.zeros_like(score))
+        w = w.clamp_min(0.0)
+        if w.sum() <= 0:
+            # 全部区间贡献非正：退回均匀分布
+            p = torch.full_like(w, 1.0 / K)
         else:
-            # 全局带符号 softmax + z_cap（对照实验做法）
-            std = score.std().clamp_min(1e-12)
-            z = self.eta * (score - score.mean()) / std
-        z = z.clamp(-cap, cap)
-        w = torch.exp(z - z.max())
-        w = w / w.sum()
-        self.t_weight.mul_(0.0).add_((1.0 - self.eps) * w + self.eps / K)
+            p = w / w.sum()
+        # 防坍缩截断 + 再归一化（截断会破坏归一性，迭代两轮近似收敛）
+        for _ in range(2):
+            p = p.clamp(self.p_min, self.p_max)
+            p = p / p.sum()
+        self.t_weight.copy_(p)
 
     def sample_probs(self, probe: DtProbe) -> Optional[torch.Tensor]:
         """apply='sample'：把桶权重映射为训练网格上的采样分布；否则返回 None。"""
@@ -276,7 +270,7 @@ class TWeightScheduler(nn.Module):
 
 class TAdaptive(nn.Module):
     """
-    t 自适应总控：DtProbe（测 Dt） + TWeightScheduler（Dt -> wt -> 控制采样）。
+    t 自适应总控：DtProbe（测 Dt/μt） + TWeightScheduler（μt -> wt -> 控制采样）。
     全部超参数在此集中初始化；buffer 随 checkpoint 保存/恢复。
     """
 
@@ -292,13 +286,12 @@ class TAdaptive(nn.Module):
         interval: int = 500,
         ema: float = 0.95,
         probe_batch: int = 16,
+        k: float = 1.0,              # μ 的不确定性惩罚系数（D − k·σ_D）
+        delta: float = 1e-3,         # μ 的量纲归一保护常数（E[L_0] + δ）
         # ---- TWeightScheduler 超参数 ----
         warmup_iters: int = 5000,
-        eta: float = 2.0,
-        eps: float = 0.1,
-        z_cap: float = 1.0,
-        domain: Optional[List[float]] = None,
-        pos_only: bool = False,
+        p_min: float = 0.005,
+        p_max: float = 0.3,
         joint: bool = False,
         apply: str = 'loss',
         static_window: Optional[List[int]] = None,
@@ -316,15 +309,14 @@ class TAdaptive(nn.Module):
             interval=interval,
             ema=ema,
             probe_batch=probe_batch,
+            k=k,
+            delta=delta,
         )
         self.scheduler = TWeightScheduler(
             num_bins=bins,
             warmup_iters=warmup_iters,
-            eta=eta,
-            eps=eps,
-            z_cap=z_cap,
-            domain=domain,
-            pos_only=pos_only,
+            p_min=p_min,
+            p_max=p_max,
             joint=joint,
             apply=apply,
             static_window=static_window,

@@ -125,18 +125,17 @@ class DiffAEMixin(nn.Module):
         # ---- t 自适应（实现见 t_adaptive.TAdaptive，参数原样透传）----
         t_weight_enabled: bool = False,
         t_weight_warmup_iters: int = 5000,
-        t_weight_eta: float = 2.0,
-        t_weight_eps: float = 0.1,
         t_weight_bins: int = 16,
         t_weight_interval: int = 500,
         t_weight_ema: float = 0.95,
         t_weight_probe_batch: int = 16,
         t_weight_static_window: Optional[List[int]] = None,  # 如 [100,500]，设置后禁用动态更新
+        t_weight_k: float = 1.0,        # 贡献度 μ 的不确定性惩罚系数（D − k·σ_D）
+        t_weight_delta: float = 1e-3,   # 贡献度 μ 的量纲归一保护常数（E[L_0] + δ）
         t_weight_joint: bool = False,     # True = cos 计分：1-cos(ε̂_cond, ε̂_zero)
-        t_weight_z_cap: float = 1.0,      # 标准化分数截断（防单桶权重劫持）
-        t_weight_domain: Optional[List[float]] = None,  # logSNR 定义域 [lo, hi]
+        t_weight_p_min: float = 0.005,    # 探索地板（每区间采样概率下界）
+        t_weight_p_max: float = 0.3,      # 防坍缩截断（每区间采样概率上界）
         t_weight_apply: str = 'loss',     # 'loss' = 加权 loss；'sample' = 作为 t 的采样分布
-        t_weight_pos_only: bool = False,  # True = 正值竞争 + domain
         # ---- 结构化加噪（选址见 masking.MaskSelector，施加见 masking.MaskApplier）----
         diffae_pred_x0: bool = False,     # True = 网络直接预测 x0（可见区去噪 + 蒙区靠 z_sem 重构）
         diffae_mask_ratio: float = 0.0,   # 蒙块比例 0~1，0 = 关闭
@@ -236,11 +235,10 @@ class DiffAEMixin(nn.Module):
             ema=t_weight_ema,
             probe_batch=t_weight_probe_batch,
             warmup_iters=t_weight_warmup_iters,
-            eta=t_weight_eta,
-            eps=t_weight_eps,
-            z_cap=t_weight_z_cap,
-            domain=t_weight_domain,
-            pos_only=t_weight_pos_only,
+            k=t_weight_k,
+            delta=t_weight_delta,
+            p_min=t_weight_p_min,
+            p_max=t_weight_p_max,
             joint=t_weight_joint,
             apply=t_weight_apply,
             static_window=t_weight_static_window,
