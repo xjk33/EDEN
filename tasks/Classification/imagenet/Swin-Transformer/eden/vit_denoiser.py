@@ -44,6 +44,16 @@ def modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch
     return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
 
 
+def _gelu_tanh() -> nn.Module:
+    """GELU(tanh 近似)；approximate 参数为 torch 1.12 新增，
+    旧环境（如分类任务的 py3.7 + torch≤1.11）退化为精确 GELU——
+    两者最大偏差约 1e-3，对去噪仪器无实质影响。"""
+    try:
+        return nn.GELU(approximate="tanh")
+    except TypeError:
+        return nn.GELU()
+
+
 class DiTBlock(nn.Module):
     """标准 ViT block + adaLN-Zero 条件注入（DiT 做法）。"""
 
@@ -58,7 +68,7 @@ class DiTBlock(nn.Module):
         hidden = int(dim * mlp_ratio)
         self.mlp = nn.Sequential(
             nn.Linear(dim, hidden),
-            nn.GELU(approximate="tanh"),
+            _gelu_tanh(),
             nn.Linear(hidden, dim),
         )
         # 条件 MLP：两层，隐层压到 1/4（i-DAE 减参技巧），输出 6 路调制量
