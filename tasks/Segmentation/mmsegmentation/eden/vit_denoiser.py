@@ -54,6 +54,23 @@ def _gelu_tanh() -> nn.Module:
         return nn.GELU()
 
 
+# scaled_dot_product_attention 为 torch 2.0 新增；旧环境（torch≤1.13）
+# 回退为标准手写注意力（数学上完全等价，仅少了 fused kernel 的速度）。
+try:
+    from torch.nn.functional import scaled_dot_product_attention as _sdpa
+except ImportError:
+    _sdpa = None
+
+
+def _attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    """q/k/v: [B, heads, N, head_dim] -> [B, heads, N, head_dim]。"""
+    if _sdpa is not None:
+        return _sdpa(q, k, v)
+    scale = q.shape[-1] ** -0.5
+    attn = (q @ k.transpose(-2, -1)) * scale
+    return attn.softmax(dim=-1) @ v
+
+
 class DiTBlock(nn.Module):
     """标准 ViT block + adaLN-Zero 条件注入（DiT 做法）。"""
 
@@ -90,7 +107,7 @@ class DiTBlock(nn.Module):
         h = modulate(self.norm1(x), shift_msa, scale_msa)
         q, k, v = self.qkv(h).reshape(B, N, 3, self.num_heads, D // self.num_heads) \
             .permute(2, 0, 3, 1, 4).unbind(0)
-        h = nn.functional.scaled_dot_product_attention(q, k, v)
+        h = _attention(q, k, v)
         h = h.transpose(1, 2).reshape(B, N, D)
         x = x + gate_msa.unsqueeze(1) * self.attn_proj(h)
 
