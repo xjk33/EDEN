@@ -1,0 +1,31 @@
+# EDEN 组合臂·小日程版（定性分析 / 消融代理实验，单卡 A100 ~8~11 小时）
+# 继承终版组合（t 自适应 + 结构化掩码），只压训练日程并对齐短日程参数：
+#   - EPOCHS 120 -> 12（全程 ~12 万步 @bs128 单卡），cosine 调度随之收缩；
+#   - WARMUP_EPOCHS 20 -> 1（默认 20 比总日程还长，必须改）；
+#   - BASE_LR 5e-5 -> 5e-4：按官方线性缩放规则（1e-3 @ 总 batch 1024），
+#     单卡 bs128 经仓库缩放后实际峰值 1.25e-4；三个臂须用同一组 lr；
+#   - T_WEIGHT_WARMUP_ITERS 5000 -> 2000：短日程按比例缩短预热
+#     （2000 步 = 4 轮探针，足够 μ̄ 的 EMA 稳定；引导期仍占 ~83% 日程）；
+#   - DIFF_WARMUP_ITERS 2000 -> 1000：diffae 分支 lr warmup 同步收缩。
+# 机制超参（K/I/B_p/ρ/k/δ、ratio/alpha/patch）与终版组合完全一致，不动。
+# 定性结论（谁好谁差）通常在此日程已可分；绝对精度不可与长日程对比。
+# 用法：
+#   python -m torch.distributed.launch --nproc_per_node 1 main_eden.py \
+#       --cfg configs/swinv2/swinv2_tiny_patch4_window8_256_eden_tweight_mask_mini.yaml \
+#       --data-path <imagenet> --batch-size 128
+BASE: ['swinv2_tiny_patch4_window8_256_eden_tweight_mask.yaml']
+
+TAG: 'eden_tweight_mask_mini'
+
+TRAIN:
+  EPOCHS: 12
+  WARMUP_EPOCHS: 1
+  BASE_LR: 5.0e-4
+  WARMUP_LR: 5.0e-7
+  MIN_LR: 5.0e-6
+
+EDEN:
+  T_WEIGHT_WARMUP_ITERS: 2000
+  DIFF_WARMUP_ITERS: 1000
+
+SAVE_FREQ: 3   # 小日程不用每 epoch 存盘（ckpt ~0.5G/个）
