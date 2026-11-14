@@ -129,15 +129,15 @@ class DiffAEMixin(nn.Module):
         t_weight_interval: int = 500,
         t_weight_ema: float = 0.95,
         t_weight_probe_batch: int = 16,
-        t_weight_k: float = 1.0,        # 贡献度 μ 的不确定性惩罚系数（D − k·σ_D）
+        t_weight_k: float = 0.5,        # 贡献度 μ 的不确定性惩罚系数（D − k·σ_D）
         t_weight_delta: float = 1e-3,   # 贡献度 μ 的量纲归一保护常数（E[L_0] + δ）
         t_weight_eps: Optional[float] = None,  # 采样分布的均匀保底总份额；None = 1/K
         # ---- 结构化掩码（选址见 masking.MaskSelector，施加见 masking.MaskApplier）----
         diffae_pred_x0: bool = False,     # True = 网络直接预测 x0（可见区去噪 + 蒙区靠 z_sem 重构）
         diffae_mask_enabled: bool = False,# 任务引导结构化掩码总开关
         diffae_mask_patch: int = 16,      # 蒙块边长（像素；128 图上 16px = 8×8 = 64 块）
-        diffae_mask_ratio: float = 0.25,  # 掩码量：每图按 softmax(G) 概率无放回采 round(ratio·n) 块
-        diffae_mask_alpha: float = 1.0,   # 软替换程度：蒙区向均值色混合的强度（1=完全替换，0=不蒙）
+        diffae_mask_ratio: float = 0.25,  # 数量限制：每图按 softmax(G) 概率无放回采 round(ratio·n) 块
+        diffae_mask_alpha: float = 1.0,   # 掩码强度：蒙区向均值色混合的强度（1=完全替换，0=不蒙）
         # ---- ANTS：可学习 Beta t 采样器（实现见 beta_sampler.py，与 t_weight 互斥）----
         ants_enabled: bool = False,
         ants_lr: float = 1e-3,                 # 采样器 Adam lr（原文 1e-3）

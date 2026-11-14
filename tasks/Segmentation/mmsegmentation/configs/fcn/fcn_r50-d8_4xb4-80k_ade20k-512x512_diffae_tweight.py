@@ -18,7 +18,7 @@ model = dict(
     t_weight_interval=500,
     t_weight_ema=0.95,
     t_weight_probe_batch=16,
-    t_weight_k=1.0,
+    t_weight_k=0.5,            # k：不确定性惩罚系数（论文 k 消融最优值）
     t_weight_delta=1e-3,
 )
 

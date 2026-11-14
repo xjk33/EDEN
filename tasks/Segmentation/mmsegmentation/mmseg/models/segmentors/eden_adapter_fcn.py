@@ -161,15 +161,15 @@ class FCNWithDiffAE(DiffAEMixin, EncoderDecoder):
         t_weight_interval: int = 500,
         t_weight_ema: float = 0.95,
         t_weight_probe_batch: int = 16,
-        t_weight_k: float = 1.0,        # 贡献度 μ 的不确定性惩罚系数（D − k·σ_D）
+        t_weight_k: float = 0.5,        # 贡献度 μ 的不确定性惩罚系数（D − k·σ_D）
         t_weight_delta: float = 1e-3,   # 贡献度 μ 的量纲归一保护常数（E[L_0] + δ）
         t_weight_eps=None,              # 采样分布的均匀保底总份额；None = 1/K
         # ---- 结构化掩码（透传给 DiffAEMixin -> MaskSelector / MaskApplier）----
         diffae_pred_x0: bool = False,
         diffae_mask_enabled: bool = False,
         diffae_mask_patch: int = 16,
-        diffae_mask_ratio: float = 0.25,
-        diffae_mask_alpha: float = 1.0,
+        diffae_mask_ratio: float = 0.25,  # 数量限制：每图蒙 round(ratio·n) 块
+        diffae_mask_alpha: float = 1.0,   # 掩码强度：1=完全替换为均值色，0=不蒙
         **kwargs,
     ):
         super().__init__(

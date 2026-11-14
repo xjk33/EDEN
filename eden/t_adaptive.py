@@ -47,7 +47,7 @@ class UtProbe(nn.Module):
         interval: int = 500,          # 每多少训练步测一轮
         ema: float = 0.95,            # 贡献度 EMA 系数 ρ
         probe_batch: int = 16,        # 每轮探针用多少样本（B_p）
-        k: float = 1.0,               # 不确定性惩罚系数（μ 分子 D − k·σ_D）
+        k: float = 0.5,               # 不确定性惩罚系数（μ 分子 D − k·σ_D）
         delta: float = 1e-3,          # 量纲归一保护常数（μ 分母 E[L_0] + δ）
     ):
         super().__init__()
@@ -200,7 +200,7 @@ class TAdaptive(nn.Module):
         interval: int = 500,
         ema: float = 0.95,
         probe_batch: int = 16,
-        k: float = 1.0,              # μ 的不确定性惩罚系数（D − k·σ_D）
+        k: float = 0.5,              # μ 的不确定性惩罚系数（D − k·σ_D）
         delta: float = 1e-3,         # μ 的量纲归一保护常数（E[L_0] + δ）
         # ---- TWeightScheduler 超参数 ----
         warmup_iters: int = 5000,
