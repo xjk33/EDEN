@@ -53,4 +53,19 @@ scaler.update()
 
 for k, v in losses.items():
     print(f'  {k}: {v.item() if hasattr(v, "item") else v}')
+
+print('== 5. DDP 包装（单进程 gloo；验证 state_dict 广播兼容） ==')
+import os
+import torch.distributed as dist
+os.environ.setdefault('MASTER_ADDR', '127.0.0.1')
+os.environ.setdefault('MASTER_PORT', '29517')
+dist.init_process_group(backend='gloo', world_size=1, rank=0)
+ddp = torch.nn.parallel.DistributedDataParallel(
+    model, device_ids=[0], broadcast_buffers=False)
+with torch.cuda.amp.autocast(enabled=True):
+    losses2 = ddp(samples, targets, criterion)
+(losses2['loss_task'] + losses2['loss_diffae']).backward()
+print('  DDP forward/backward OK')
+dist.destroy_process_group()
+
 print('== 全部通过 ==')

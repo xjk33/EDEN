@@ -519,14 +519,37 @@ class DiffAEMixin(nn.Module):
     def diffae_ema_step(self):
         self.ema.step()
 
+    def _apply(self, fn, *args, **kwargs):
+        # 让 model.to(device)/.cuda()/.float() 同时作用于 EMA shadow：
+        # shadow 是注册体系之外的普通 dict，默认不随模型迁移；
+        # torch DDP 初始化时按 state_dict 广播全量状态，
+        # CPU 阴影混进广播列表会被 NCCL 拒绝。
+        ret = super()._apply(fn, *args, **kwargs)
+        ema = getattr(self, 'ema', None)   # 构造完成前 _apply 不会被调用，防御而已
+        if ema is not None:
+            for name in ema.shadow:
+                ema.shadow[name] = fn(ema.shadow[name])
+        return ret
+
     def state_dict(self, *args, **kwargs):
         state = super().state_dict(*args, **kwargs)
-        state["diffae_ema_shadow"] = self.ema.state_dict()
+        # EMA shadow 摊平为独立 tensor 键、不嵌套 dict：
+        # torch DDP 初始化用 state_dict().values() 做全量广播（1.x/2.x 同），
+        # 嵌套 dict 会触发 _broadcast_coalesced 的 pybind 参数类型错误。
+        for name, tensor in self.ema.state_dict().items():
+            state[f'diffae_ema_shadow.{name}'] = tensor
         return state
 
     def load_state_dict(self, state_dict, strict: bool = True):
+        # 兼容两种存储：嵌套 dict（旧格式 ckpt）与摊平键（现格式）
         ema_shadow = state_dict.pop("diffae_ema_shadow", None)
+        flat_prefix = 'diffae_ema_shadow.'
+        flat = {}
+        for k in [k for k in state_dict.keys() if k.startswith(flat_prefix)]:
+            flat[k[len(flat_prefix):]] = state_dict.pop(k)
         super().load_state_dict(state_dict, strict=strict)
+        if ema_shadow is None and flat:
+            ema_shadow = flat
         if ema_shadow is not None:
             self.ema.load_state_dict(ema_shadow)
 
