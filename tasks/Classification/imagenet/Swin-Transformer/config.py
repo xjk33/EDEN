@@ -147,6 +147,50 @@ _C.MODEL.SIMMIM.NORM_TARGET.ENABLE = False
 _C.MODEL.SIMMIM.NORM_TARGET.PATCH_SIZE = 47
 
 # -----------------------------------------------------------------------------
+# EDEN settings（DiffAE 解耦表征约束 + t 自适应 + 结构化掩码；
+# 实现见 eden/ 包与 eden_adapter_swinv2.py，入口为 main_eden.py）
+# -----------------------------------------------------------------------------
+_C.EDEN = CN()
+# 总开关（main_eden.py 要求为 True；关闭时请直接用 main.py 跑 baseline）
+_C.EDEN.ENABLED = False
+# 扩散输入：任务图像双线性缩放到 IMAGE_SIZE² 并映射到 [-1, 1]
+_C.EDEN.IMAGE_SIZE = 128
+# z_sem 维度 = SwinV2 分类器输入特征维度（tiny: 768）；COND_DIM 相同则
+# diffae_enc_compress 退化为 Identity
+_C.EDEN.ENC_OUTPUT_DIM = 768
+_C.EDEN.COND_DIM = 768
+# DiT 去噪器（弱仪器，i-DAE 路线；表征已解耦到任务 encoder，仪器只做小）
+_C.EDEN.DIT_SIZE = 'ti'          # 'ti'(~6.7M) | 's'(~25.8M) | 'b'(~100M)
+_C.EDEN.DIT_PATCH = 16
+_C.EDEN.DIT_MLP_RATIO = 4.0
+_C.EDEN.ADALN_HIDDEN_MULT = 0.25
+# 扩散过程
+_C.EDEN.NUM_DIFFUSION_TIMESTEPS = 1000
+_C.EDEN.BETA_SCHEDULE = 'linear'
+_C.EDEN.SPACED_TIMESTEPS = 'ddim100'
+_C.EDEN.EMA_DECAY = 0.9999
+_C.EDEN.LAMBDA_DIFF = 1.0
+# x0 参数化（I-DAE 形式；可见区去噪 + 蒙区靠 z_sem 重构合并为单次 loss）
+_C.EDEN.PRED_X0 = True
+# t 自适应（论文 3.2）
+_C.EDEN.T_WEIGHT_ENABLED = False
+_C.EDEN.T_WEIGHT_WARMUP_ITERS = 5000   # W：预热步数（与掩码预热共用，3.4）
+_C.EDEN.T_WEIGHT_BINS = 16             # K：logSNR 等频区间数
+_C.EDEN.T_WEIGHT_INTERVAL = 500        # I：探针间隔（步）
+_C.EDEN.T_WEIGHT_EMA = 0.95            # ρ：贡献度 EMA 系数
+_C.EDEN.T_WEIGHT_PROBE_BATCH = 16      # B_p：每轮探针样本数
+_C.EDEN.T_WEIGHT_K = 0.5               # k：不确定性惩罚系数（论文 k 消融最优）
+_C.EDEN.T_WEIGHT_DELTA = 1e-3          # δ：量纲归一保护常数
+# 结构化掩码（论文 3.3；两个控制量：数量限制 + 掩码强度）
+_C.EDEN.MASK_ENABLED = False
+_C.EDEN.MASK_PATCH = 16                # 蒙块边长（128 图上 8×8 = 64 块）
+_C.EDEN.MASK_RATIO = 0.25              # 数量限制：每图蒙 round(ratio·n) 块
+_C.EDEN.MASK_ALPHA = 1.0               # 掩码强度：1=完全替换为均值色，0=不蒙
+# 扩散分支独立优化器（task 分支完全沿用 baseline 的 optimizer/scheduler）
+_C.EDEN.DIFF_LR = 1e-4                 # AdamW 峰值 lr（固定，不随 batch 折算）
+_C.EDEN.DIFF_WARMUP_ITERS = 2000       # LinearLR warmup 步数，之后余弦退火到 0
+
+# -----------------------------------------------------------------------------
 # Training settings
 # -----------------------------------------------------------------------------
 _C.TRAIN = CN()

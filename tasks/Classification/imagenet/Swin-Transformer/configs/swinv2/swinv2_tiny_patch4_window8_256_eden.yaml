@@ -1,0 +1,38 @@
+# EDEN 基础臂：SwinV2-T + DiffAE 去噪约束（t 自适应关、结构化掩码关）
+# 任务侧（数据/增广/优化器/调度/epoch）全部继承 baseline yaml 与本仓库默认值，
+# 不做任何修改——与论文"baseline 训练参数均和 baseline 默认一致"的约定对齐。
+# 扩散侧：z_sem = forward_features 输出（分类器输入特征，768 维），
+# DiT-Ti 弱仪器 + x0 预测（I-DAE 形式），扩散分支独立 AdamW(1e-4) + 余弦。
+# 用法：
+#   python -m torch.distributed.launch --nproc_per_node 4 main_eden.py \
+#       --cfg configs/swinv2/swinv2_tiny_patch4_window8_256_eden.yaml \
+#       --data-path <imagenet> --batch-size 128
+BASE: ['swinv2_tiny_patch4_window8_256.yaml']
+
+TAG: 'eden'
+
+EDEN:
+  ENABLED: True
+  # ---- 扩散输入与条件 ----
+  IMAGE_SIZE: 128            # 任务图像（256²）双线性缩到 128² 进扩散分支
+  ENC_OUTPUT_DIM: 768        # z_sem = forward_features 输出（swinv2 tiny: 768）
+  COND_DIM: 768              # == ENC_OUTPUT_DIM，enc_compress 退化为 Identity
+  # ---- DiT 去噪器（弱仪器；表征已解耦到任务 encoder，仪器只做小）----
+  DIT_SIZE: 'ti'             # ~6.7M
+  DIT_PATCH: 16
+  DIT_MLP_RATIO: 4.0
+  ADALN_HIDDEN_MULT: 0.25
+  # ---- 扩散过程 ----
+  NUM_DIFFUSION_TIMESTEPS: 1000
+  BETA_SCHEDULE: 'linear'
+  SPACED_TIMESTEPS: 'ddim100'
+  EMA_DECAY: 0.9999
+  LAMBDA_DIFF: 1.0
+  PRED_X0: True              # x0 参数化（I-DAE 形式）
+  # ---- t 自适应（本臂关闭）----
+  T_WEIGHT_ENABLED: False
+  # ---- 结构化掩码（本臂关闭）----
+  MASK_ENABLED: False
+  # ---- 扩散分支独立优化器 ----
+  DIFF_LR: 1e-4
+  DIFF_WARMUP_ITERS: 2000
