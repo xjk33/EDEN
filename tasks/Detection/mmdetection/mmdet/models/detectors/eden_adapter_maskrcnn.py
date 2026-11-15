@@ -22,6 +22,7 @@ import torch
 import torch.nn.functional as F
 from mmengine.model import MMDistributedDataParallel
 from mmengine.optim import OptimWrapperDict
+from mmengine.registry import MODEL_WRAPPERS as MMENGINE_MODEL_WRAPPERS
 from mmdet.models.detectors.mask_rcnn import MaskRCNN
 from mmdet.registry import (MODEL_WRAPPERS, MODELS, OPTIM_WRAPPER_CONSTRUCTORS,
                             OPTIM_WRAPPERS, OPTIMIZERS)
@@ -98,6 +99,9 @@ class SplitOptimWrapperConstructor:
         return OptimWrapperDict(**wrappers)
 
 
+# 双注册：Runner.wrap_model 用 mmengine 根注册表解析 type，挂到根上最稳；
+# mmdet 子表同步注册，保持与仓库内其他注册风格一致。
+@MMENGINE_MODEL_WRAPPERS.register_module(force=True)
 @MODEL_WRAPPERS.register_module(force=True)
 class EDENDistributedDataParallel(MMDistributedDataParallel):
     """
