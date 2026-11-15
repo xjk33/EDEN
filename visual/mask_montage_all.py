@@ -138,16 +138,23 @@ def _plt():
     return plt
 
 
-def plot_mask_montage(task_panels, mode='masked', save_path=None, dpi=DPI):
+def plot_mask_montage(task_panels, mode='masked', save_path=None, dpi=DPI,
+                      norm=None):
     """四任务掩码拼图：行 = 任务，列 = [原图 | 早期 | 中期 | 晚期]。
 
     task_panels: list of dict ——
         {'name': str, 'img': [3,S,S] 原图,
          'cells': list of (stage_label, cell_array)}
         mode='masked' 时 cell_array = [3,S,S] 蒙后输入；
-        mode='prob' / 'g' 时 = [g,g] 热力（全部 cell 共享色标）。
+        mode='prob' / 'g' 时 = [g,g] 热力。
+    norm（仅 prob/g）：'global' 全图共享色标（幅度可比，但任务间 G 量级
+        差可达数个数量级，小值行会全黑）；'row' 每任务行共享（保留该任务
+        的阶段间幅度演化）；'panel' 逐 cell 自适应（只看空间 pattern）。
+        None = 'g' 用 'panel'、'prob' 用 'global'。
     """
     plt = _plt()
+    if norm is None:
+        norm = 'panel' if mode == 'g' else 'global'
     rows = [p for p in task_panels if p is not None and p['cells']]
     if not rows:
         print('[plot_mask_montage] 没有任何任务数据，跳过'
@@ -157,7 +164,7 @@ def plot_mask_montage(task_panels, mode='masked', save_path=None, dpi=DPI):
     n_c = 1 + max(len(p['cells']) for p in rows)
 
     vmin = vmax = None
-    if mode in ('prob', 'g'):
+    if mode in ('prob', 'g') and norm == 'global':
         allv = np.concatenate([c[1].ravel() for p in rows for c in p['cells']])
         vmin, vmax = float(allv.min()), float(allv.max())
 
@@ -169,6 +176,10 @@ def plot_mask_montage(task_panels, mode='masked', save_path=None, dpi=DPI):
         axes[r, 0].imshow(p['img'].transpose(1, 2, 0))
         axes[r, 0].set_ylabel(p['name'], fontsize=9, rotation=0,
                               ha='right', va='center')
+        vmin_r = vmax_r = None
+        if mode in ('prob', 'g') and norm == 'row':
+            rv = np.concatenate([c[1].ravel() for c in p['cells']])
+            vmin_r, vmax_r = float(rv.min()), float(rv.max())
         for c in range(1, n_c):
             ax = axes[r, c]
             if c - 1 < len(p['cells']):
@@ -176,19 +187,30 @@ def plot_mask_montage(task_panels, mode='masked', save_path=None, dpi=DPI):
                 if mode == 'masked':
                     ax.imshow(cell.transpose(1, 2, 0))
                 else:
+                    kw = {}
+                    if norm == 'global':
+                        kw = dict(vmin=vmin, vmax=vmax)
+                    elif norm == 'row':
+                        kw = dict(vmin=vmin_r, vmax=vmax_r)
                     im = ax.imshow(cell, cmap='turbo', interpolation='nearest',
-                                   vmin=vmin, vmax=vmax)
+                                   **kw)
+                    # panel 归一化抹掉了量纲——把各 panel 的 max 以小字注回，
+                    # 幅度演化的信息不丢（G 的量纲随训练进程变化是现象本身）
+                    if norm == 'panel':
+                        ax.text(0.5, -0.07, f'max={cell.max():.1e}',
+                                transform=ax.transAxes, ha='center',
+                                va='top', fontsize=6, color='0.3')
                 if r == 0:
                     ax.set_title(lab, fontsize=9)
             ax.axis('off')
         axes[r, 0].axis('off')
     if rows:
         axes[0, 0].set_title('Original', fontsize=9)
-    if im is not None:
+    if im is not None and norm == 'global':
         fig.colorbar(im, ax=axes.ravel().tolist(), fraction=0.02, pad=0.01)
     supt = {'masked': 'structured mask evolution (masked input)',
             'prob': 'mask sampling probability evolution',
-            'g': 'task sensitivity G evolution'}[mode]
+            'g': f'task sensitivity G evolution (norm={norm})'}[mode]
     fig.suptitle(supt, fontsize=11)
     fig.tight_layout()
     if save_path:
@@ -233,6 +255,8 @@ def main():
                     help='覆盖某任务的三个 ckpt tag，如 '
                          '--stages cls=ckpt_epoch_0,ckpt_epoch_6,ckpt_epoch_11'
                          '（可多次）')
+    ap.add_argument('--norm', default=None, choices=['global', 'row', 'panel'],
+                    help='prob/g 热力的色标归一化（默认 g=panel, prob=global）')
     args = ap.parse_args()
     keys = args.tasks or list(TASKS)
     for k in keys:
@@ -254,7 +278,7 @@ def main():
     for mode in args.modes:
         panels = [build_task_panel(k, mode) for k in keys]
         fig = plot_mask_montage(
-            panels, mode=mode,
+            panels, mode=mode, norm=args.norm,
             save_path=os.path.join(OUT_DIR, f'montage_{mode}.png'))
         if fig is not None:
             print(f'saved {OUT_DIR}/montage_{mode}.png')

@@ -136,8 +136,9 @@ class DiffAEMixin(nn.Module):
         diffae_pred_x0: bool = False,     # True = 网络直接预测 x0（可见区去噪 + 蒙区靠 z_sem 重构）
         diffae_mask_enabled: bool = False,# 任务引导结构化掩码总开关
         diffae_mask_patch: int = 16,      # 蒙块边长（像素；128 图上 16px = 8×8 = 64 块）
-        diffae_mask_ratio: float = 0.25,  # 数量限制：每图按 softmax(G) 概率无放回采 round(ratio·n) 块
+        diffae_mask_ratio: float = 0.25,  # 数量限制：每图按 softmax((h/h̄)/τ) 概率无放回采 round(ratio·n) 块
         diffae_mask_alpha: float = 1.0,   # 掩码强度：蒙区向均值色混合的强度（1=完全替换，0=不蒙）
+        diffae_mask_tau: float = 1.0,     # 采样温度 τ：logits = (h/h̄)/τ（τ→0 硬 top-k，τ→∞ 均匀）
         # ---- ANTS：可学习 Beta t 采样器（实现见 beta_sampler.py，与 t_weight 互斥）----
         ants_enabled: bool = False,
         ants_lr: float = 1e-3,                 # 采样器 Adam lr（原文 1e-3）
@@ -239,6 +240,7 @@ class DiffAEMixin(nn.Module):
             patch=diffae_mask_patch,
             ratio=diffae_mask_ratio,
             warmup_iters=t_weight_warmup_iters,
+            tau=diffae_mask_tau,
         )
         self.mask_applier = MaskApplier(alpha=diffae_mask_alpha)
 

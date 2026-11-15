@@ -8,7 +8,8 @@
 
 机制：
   - 空间敏感度 G = |∂L_task/∂x₀|（在 adapter 中计算，此处只消费热力图）
-  - 块级概率   = G 划块取均值得 h，逐图 softmax 得逐块概率 p
+  - 块级概率   = G 划块取均值得 h，逐图均值归一后 softmax((h/h̄)/τ) 得逐块
+    概率 p（尺度不变化：引导强度与 G 的绝对量纲无关，τ 控软硬）
   - 掩码采样   = 每图按 p 无放回采固定数量 k = round(ratio·n) 个块
     （Gumbel-top-k 技巧：log p + Gumbel 噪声取前 k，等价于按 p 无放回采样）
   - 预热期     = 前 warmup_iters 步退化为均匀采样（同样 k 块、位置随机，
@@ -26,7 +27,9 @@ class MaskSelector:
     """
     选址：敏感度热力图 -> 0/1 keep-mask [B,1,H,W]（1=保留，0=被选中蒙住）。
 
-    每图按 softmax(h) 概率无放回采固定 k = round(ratio·n) 个块；
+    每图按 softmax((h/h̄)/τ) 概率无放回采固定 k = round(ratio·n) 个块
+    （h̄ 为逐图块均值——尺度不变化：logits 是"相对敏感度"，与 G 的绝对
+    量纲无关；τ 控采样软硬：τ→0 趋近硬 top-k，τ→∞ 趋近均匀）；
     预热期内概率退化为均匀（同样 k 块、位置随机）。
     """
 
@@ -36,11 +39,15 @@ class MaskSelector:
         patch: int = 16,           # 蒙块边长（像素；128 图上 16px = 8×8 = 64 块）
         ratio: float = 0.25,       # 掩码量：每图蒙块比例（块数 = round(ratio·n)）
         warmup_iters: int = 5000,  # 预热期：均匀随机采样，不启用 G 引导
+        tau: float = 1.0,          # 采样温度 τ：logits = (h/h̄)/τ
+        delta: float = 1e-8,       # 归一化保护常数（h̄=0 时退化为均匀，不除零）
     ):
         self.enabled = enabled
         self.patch = patch
         self.ratio = ratio
         self.warmup_iters = warmup_iters
+        self.tau = tau
+        self.delta = delta
         self._step = 0             # 已选址次数（训练步），预热计时用
 
     def select(self, heatmap: torch.Tensor, guided: bool = None,
@@ -67,9 +74,15 @@ class MaskSelector:
         k = max(1, int(round(r * n)))                          # 每图固定蒙块数
 
         if guided:
-            # 块内均值 -> 逐图 softmax 概率
+            # 块内均值 -> 逐图归一化 -> softmax 概率。
+            # 除以逐图均值 h̄（尺度不变化）：logits = 相对敏感度，与 G 的
+            # 绝对量纲无关——否则小梯度任务（如 det，G~1e-4）softmax 退化
+            # 为均匀分布，G 引导失效。G≈0 的块仍有 e⁰=1 的基础概率
+            # （全支撑，保留探索）；h̄=0（梯度全零）时 logits 全 0，
+            # 自动退化为均匀采样。
             h = F.adaptive_avg_pool2d(heatmap, (g_h, g_w)).reshape(B, n)
-            prob = torch.softmax(h, dim=1)
+            logits = h / (h.mean(dim=1, keepdim=True) + self.delta) / self.tau
+            prob = torch.softmax(logits, dim=1)
         else:
             # 预热期：均匀概率（位置随机，数量相同）
             prob = torch.full((B, n), 1.0 / n, device=heatmap.device)

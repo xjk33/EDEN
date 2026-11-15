@@ -522,7 +522,7 @@ def read_tweight_snapshot(model):
 # =====================================================================
 # 测量 4：mask-meta（空间版 ut×meta-grad：G 与分块一阶内积的相关性裁判）
 # =====================================================================
-MASK_META_VERSION = 2      # 双掩码（G 场 + IP 场）共享噪声采样版；notebook 断言用
+MASK_META_VERSION = 3      # 双掩码尺度不变化版（同 MaskSelector (h/h̄)/τ）；notebook 断言用
 
 
 def _gumbel_topk(logits, k, u):
@@ -627,17 +627,23 @@ def measure_mask_meta(model, batch, n_t=8, n_noise=2, mask_ratio=None, seed=0):
         rho_s.append(r_s)
         rho_p.append(r_p)
 
-        # ---- 双掩码现采：G 场与 IP 场各自 softmax，共享 Gumbel 噪声 top-k ----
+        # ---- 双掩码现采：G 场与 IP 场各自归一化，共享 Gumbel 噪声 top-k ----
         sel = model.mask_selector
         ratio = mask_ratio if mask_ratio is not None else (
             sel.ratio if (sel.enabled and sel.ratio > 0) else 0.25)
         k_blk = max(1, int(round(ratio * g * g)))
         with torch.no_grad():
+            # 与 MaskSelector 引导期同口径（尺度不变化）：两场各自除逐图
+            # 均值，否则原始量纲下 Gumbel 噪声主导排序，IoU 比较失真
+            tau = getattr(sel, 'tau', 1.0)
+            delta = getattr(sel, 'delta', 1e-8)
             p_g = g_blk.reshape(1, -1)
             p_ip = ip_blk.clamp_min(0).reshape(1, -1)   # 负贡献不参与选址
+            lg = p_g / (p_g.mean(dim=1, keepdim=True) + delta) / tau
+            li = p_ip / (p_ip.mean(dim=1, keepdim=True) + delta) / tau
             u = torch.rand(1, g * g, generator=gen_mask).to(device)  # 共享噪声
-            keep_g = _gumbel_topk(p_g, k_blk, u).view(1, 1, g, g)
-            keep_ip = _gumbel_topk(p_ip, k_blk, u).view(1, 1, g, g)
+            keep_g = _gumbel_topk(lg, k_blk, u).view(1, 1, g, g)
+            keep_ip = _gumbel_topk(li, k_blk, u).view(1, 1, g, g)
             mg, mi = 1.0 - keep_g, 1.0 - keep_ip        # 1=被蒙
             union = (mg + mi - mg * mi).sum().clamp_min(1e-12)
             ious.append(float((mg * mi).sum() / union))
@@ -1419,7 +1425,7 @@ def plot_grad_cos_variance(gres, title='', save_path=None):
 # 与 mask_meta（测量 4，IP 金标准裁判）的区别：这里不碰去噪器、不算分块一阶
 # 内积，只做"这个 ckpt 当前会怎么蒙"的展示测量——G 热力 -> 块级采样概率 ->
 # 现采掩码 -> 蒙后输入，成本低两个量级，适合跨任务跨 ckpt 批量出图。
-MASK_VIZ_VERSION = 1      # notebook 断言用
+MASK_VIZ_VERSION = 3      # notebook 断言用；3 = 引导概率与 MaskSelector 同公式 (h/h̄)/τ
 
 
 def img01_from_xis(xis, mean=IMAGENET_MEAN, std=IMAGENET_STD, scale=255.0):
@@ -1437,8 +1443,9 @@ def measure_mask_viz(model, batch, grad_fn, batch_grad=False, mask_ratio=None,
 
     与训练同口径：G = |∂L_task/∂x₀|（逐图，任务 loss 对输入的梯度）先
     adaptive_avg_pool 到 image_size²（与各 adapter 训练路径一致），再划块取
-    均值 -> 逐图 softmax 得块级采样概率 -> Gumbel-top-k 无放回定量采
-    round(ratio·n) 块（与 MaskSelector 引导期同逻辑，复用 _gumbel_topk）。
+    均值 -> 逐图归一化 softmax((h/h̄)/τ) 得块级采样概率（与 MaskSelector
+    引导期逐字节同公式，τ/δ 取自 model.mask_selector）-> Gumbel-top-k
+    无放回定量采 round(ratio·n) 块（复用 _gumbel_topk）。
     掩码施加与 MaskApplier 同公式：x̃ = w⊙x + (1−w)⊙c，w = 1−α(1−m)，
     c 为该图均值色（在 [0,1] 空间等价复算，展示用）。
 
@@ -1499,14 +1506,19 @@ def measure_mask_viz(model, batch, grad_fn, batch_grad=False, mask_ratio=None,
     for i in range(N):
         hm = F.adaptive_avg_pool2d(gmaps[i], (S, S))     # 与训练同：先池到 S²
         h = F.adaptive_avg_pool2d(hm, (g, g))            # [1,1,g,g] 块内均值
-        logits = h.reshape(1, -1)
+        h_flat = h.reshape(1, -1)
         if guided:
+            # 与 MaskSelector.select 引导期同公式（尺度不变化）：
+            # logits = (h/h̄)/τ，softmax 后是块级采样概率
+            tau = getattr(sel, 'tau', 1.0)
+            delta = getattr(sel, 'delta', 1e-8)
+            logits = h_flat / (h_flat.mean(dim=1, keepdim=True) + delta) / tau
             prob = torch.softmax(logits, dim=1)
         else:
+            logits = torch.zeros_like(h_flat)
             prob = torch.full((1, g * g), 1.0 / (g * g), device=device)
         u = torch.rand(1, g * g, generator=gen).to(device)
-        keep = _gumbel_topk(logits if guided else torch.zeros_like(logits),
-                            k, u).view(1, 1, g, g)
+        keep = _gumbel_topk(logits, k, u).view(1, 1, g, g)
         # 蒙后输入（MaskApplier 同公式，[0,1] 展示空间）
         im = F.interpolate(img01[i].to(device), size=(S, S), mode='bilinear',
                            align_corners=False)
@@ -1581,7 +1593,12 @@ def plot_mask_viz(res, title='', save_path=None, max_images=None):
         axes[i, 1].set_title('G = |dL_task/dx| (block)', fontsize=10)
         fig.colorbar(im1, ax=axes[i, 1], fraction=0.046)
         im2 = axes[i, 2].imshow(pb[i, 0], cmap='turbo', interpolation='nearest')
-        axes[i, 2].set_title('sampling prob softmax(h)', fontsize=10)
+        # 峰值倍数 = max(prob)·n / 1（均匀 = 1.0）。原始 G 幅度很小时
+        # softmax(h) ≈ 均匀（peak≈1.0），此时面板上的"热点"只是色标拉伸
+        # 的假象——标出倍数防止误读。
+        pk = float(pb[i, 0].max()) * res['g'] ** 2
+        axes[i, 2].set_title(f'sampling prob (peak {pk:.2f}x uniform)',
+                             fontsize=10)
         fig.colorbar(im2, ax=axes[i, 2], fraction=0.046)
         axes[i, 3].imshow(1.0 - mk[i, 0], cmap='gray', interpolation='nearest',
                           vmin=0, vmax=1)
@@ -1654,23 +1671,32 @@ def plot_mask_montage(cells, row_labels, col_labels, mode='rgb', title='',
 
 
 def plot_mask_viz_evolution(res_list, labels, mode='masked', max_images=4,
-                            title='', save_path=None):
+                            title='', save_path=None, norm=None):
     """跨 ckpt 演化拼图：行 = 训练阶段，列 = 同一批图（跨阶段固定，CRN）。
 
     mode: 'masked' 蒙后输入 | 'prob' 采样概率 | 'g' G 热力。
-    概率/热力面板用共享色标范围（跨阶段可比：概率的动态范围变化本身就是现象）。
+    norm（仅 prob/g）：'global' 全部面板共享色标（幅度可比，但不同任务/阶段
+        量级差大时小值面板全黑）；'row' 每行（ckpt）共享；'panel' 逐面板
+        自适应（只看空间pattern，与单步图的观感一致）。None = 'g' 用
+        'panel'、'prob' 用 'global'。
     """
     plt = _plt()
     key = {'masked': 'masked', 'prob': 'prob', 'g': 'g_block'}[mode]
+    if norm is None:
+        norm = 'panel' if mode == 'g' else 'global'
     n_r, n_c = len(res_list), min(max_images, res_list[0]['img_s'].shape[0])
     fig, axes = plt.subplots(n_r, n_c, figsize=(3.0 * n_c, 3.0 * n_r + 0.6),
                              squeeze=False)
-    vmin, vmax = None, None
-    if mode in ('prob', 'g'):
-        allv = np.concatenate([r[key].cpu().numpy().ravel()
+    vmin = vmax = None
+    if mode in ('prob', 'g') and norm == 'global':
+        allv = np.concatenate([r[key][:n_c].cpu().numpy().ravel()
                                for r in res_list])
         vmin, vmax = float(allv.min()), float(allv.max())
     for r, res in enumerate(res_list):
+        vmin_r = vmax_r = None
+        if mode in ('prob', 'g') and norm == 'row':
+            rv = res[key][:n_c].cpu().numpy()
+            vmin_r, vmax_r = float(rv.min()), float(rv.max())
         for c in range(n_c):
             ax = axes[r, c]
             v = res[key][c, 0].cpu().numpy() if mode != 'masked' else None
@@ -1678,7 +1704,13 @@ def plot_mask_viz_evolution(res_list, labels, mode='masked', max_images=4,
                 ax.imshow(res['masked'][c].cpu().numpy().transpose(1, 2, 0))
             else:
                 ax.imshow(v, cmap='turbo', interpolation='nearest',
-                          vmin=vmin, vmax=vmax)
+                          vmin=vmin_r if norm == 'row' else vmin,
+                          vmax=vmax_r if norm == 'row' else vmax)
+                # panel 归一化抹掉了量纲——各 panel 的 max 以小字注回
+                if norm == 'panel' and mode == 'g':
+                    ax.text(0.5, -0.06, f'max={v.max():.1e}',
+                            transform=ax.transAxes, ha='center',
+                            va='top', fontsize=6, color='0.3')
             ax.axis('off')
             if r == 0 and mode == 'masked':
                 ax.set_title(f'img {c}', fontsize=9)
@@ -1687,7 +1719,7 @@ def plot_mask_viz_evolution(res_list, labels, mode='masked', max_images=4,
                               ha='right', va='center')
     supt = {'masked': 'masked input evolution',
             'prob': 'mask sampling prob evolution',
-            'g': 'G heatmap evolution'}[mode]
+            'g': f'G heatmap evolution (norm={norm})'}[mode]
     fig.suptitle(f'{supt} | {title}' if title else supt)
     fig.tight_layout()
     if save_path:
