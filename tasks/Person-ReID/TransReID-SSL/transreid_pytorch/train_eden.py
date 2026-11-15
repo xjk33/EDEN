@@ -53,8 +53,10 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    # 允许 yml 中的 EDEN 节点（yacs 默认拒绝未知键）
-    cfg.set_new_allowed(True)
+    # 允许 yml 中的 EDEN 节点：新版 yacs 默认拒绝未知键需显式放开；
+    # 旧版 yacs 没有 set_new_allowed（默认就允许新键），跳过即可。
+    if hasattr(cfg, 'set_new_allowed'):
+        cfg.set_new_allowed(True)
     if args.config_file != "":
         cfg.merge_from_file(args.config_file)
     cfg.merge_from_list(args.opts)
