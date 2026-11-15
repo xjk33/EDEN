@@ -26,7 +26,7 @@ INPUT:
 
 DATASETS:
   NAMES: ('msmt17')
-  ROOT_DIR: ('/data')
+  ROOT_DIR: ('data')
 
 DATALOADER:
   SAMPLER: 'softmax_triplet'
