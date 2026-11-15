@@ -37,6 +37,8 @@ import argparse
 import glob
 import os
 import re
+import sys
+import types
 
 import numpy as np
 
@@ -97,9 +99,54 @@ _BUFFER_TAILS = {
 }
 
 
+class _StubModule(types.ModuleType):
+    """缺失模块的 unpickle 替身。Swin 的 ckpt 会把 yacs CfgNode 配置对象也
+    腌进去（eden_save_checkpoint 存了 'config'），在没装 yacs 的环境里
+    torch.load 会 ModuleNotFoundError——被 pickle 引用的任意类都给它一个
+    dict 子类替身，让反序列化能跳过这些对象（我们只需要 tensor）。"""
+
+    def __getattr__(self, attr):
+        if attr.startswith('__'):
+            raise AttributeError(attr)
+        cls = type(attr, (dict,), {})
+        setattr(self, attr, cls)
+        return cls
+
+
+def _install_stub(module_name):
+    """把缺失模块（含各级父包）注册为 stub，返回是否新装。"""
+    if module_name in sys.modules:
+        return False
+    parts = module_name.split('.')
+    for i in range(1, len(parts)):               # 父包用普通空模块即可
+        sys.modules.setdefault('.'.join(parts[:i]),
+                               types.ModuleType('.'.join(parts[:i])))
+    sys.modules[module_name] = _StubModule(module_name)
+    return True
+
+
+def _torch_load(path):
+    """torch.load 包装：显式 weights_only=False（读自己的训练 ckpt，需要
+    完整反序列化；torch>=2.6 默认 True 会直接拒绝非 tensor 对象），
+    旧版 torch 无该参数则回退；环境缺被腌对象的模块时注册 stub 重试。"""
+    for _ in range(8):                      # 链式缺模块逐个补 stub
+        try:
+            try:
+                return torch.load(path, map_location='cpu',
+                                  weights_only=False)
+            except TypeError:               # 旧版 torch 无 weights_only
+                return torch.load(path, map_location='cpu')
+        except ModuleNotFoundError as e:
+            if not e.name or not _install_stub(e.name):
+                raise
+            print(f'[tweight_all] {os.path.basename(path)}: '
+                  f'环境缺模块 {e.name}，已用 stub 跳过（不读其内容）')
+    raise RuntimeError(f'{path}: stub 重试次数耗尽')
+
+
 def _load_state_any(path):
     """拆各种 ckpt 包装，返回扁平 state_dict。"""
-    obj = torch.load(path, map_location='cpu')
+    obj = _torch_load(path)
     if not isinstance(obj, dict):
         raise ValueError(f'{path}: 无法识别的 ckpt 格式')
     for k in _WRAP_KEYS:
@@ -175,15 +222,37 @@ def _stage_key(path):
 # =====================================================================
 # 绘图
 # =====================================================================
+_CJK_FONTS = ('Noto Sans CJK SC', 'Source Han Sans SC', 'WenQuanYi Zen Hei',
+              'Microsoft YaHei', 'SimHei', 'Droid Sans Fallback',
+              'AR PL UMing CN', 'PingFang SC')
+_cjk = None
+
+
+def _cjk_available():
+    """运行时探测系统有没有可用 CJK 字体（结果缓存）。"""
+    global _cjk
+    if _cjk is None:
+        from matplotlib import font_manager
+        names = {f.name for f in font_manager.fontManager.ttflist}
+        _cjk = any(n in names for n in _CJK_FONTS)
+        if not _cjk:
+            print('[tweight_all] 系统无 CJK 字体，图中的中文自动切换为英文')
+    return _cjk
+
+
+def _zh(cn, en):
+    """图内文字：有 CJK 字体用中文，否则用英文（避免豆腐块）。"""
+    return cn if _cjk_available() else en
+
+
 def _plt():
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
-    # CJK 字体回退链：按平台常见字体顺序找，找不到就退回默认（西文照常）
-    matplotlib.rcParams['font.sans-serif'] = [
-        'Noto Sans CJK SC', 'Source Han Sans SC', 'WenQuanYi Zen Hei',
-        'Microsoft YaHei', 'SimHei', 'DejaVu Sans']
-    matplotlib.rcParams['axes.unicode_minus'] = False
+    if _cjk_available():
+        matplotlib.rcParams['font.sans-serif'] = list(_CJK_FONTS) + [
+            'DejaVu Sans']
+        matplotlib.rcParams['axes.unicode_minus'] = False
     return plt
 
 
@@ -215,7 +284,8 @@ def plot_snapshot(snap, save_path=None):
     ax.plot(snap['grid_logsnr'], snap['grid_prob'], lw=1.8, color='tab:blue')
     ax.set_xlabel('log SNR')
     ax.set_ylabel('p(t)')
-    ax.set_title('训练网格上的采样概率 p(t)', fontsize=10)
+    ax.set_title(_zh('训练网格上的采样概率 p(t)',
+                     'sampling prob p(t) on the training grid'), fontsize=10)
     ax.grid(alpha=0.3)
     fig.suptitle(f"{snap['tag']} | entropy={snap['entropy']:.3f} | "
                  f"max={w.max():.3f}@bin{int(w.argmax())}")
@@ -333,8 +403,8 @@ def plot_entropy_all(task_snaps, save_path=None):
         x = np.linspace(0, 1, len(snaps))
         ax.plot(x, [s['entropy'] for s in snaps], 'o-', ms=3,
                 label=TASKS[key]['name'])
-    ax.set_xlabel('训练进度（归一化）')
-    ax.set_ylabel('t_weight 归一化熵')
+    ax.set_xlabel(_zh('训练进度（归一化）', 'training progress (normalized)'))
+    ax.set_ylabel(_zh('t_weight 归一化熵', 't_weight normalized entropy'))
     ax.set_ylim(0, 1.02)
     ax.grid(alpha=0.3)
     ax.legend(fontsize=8)

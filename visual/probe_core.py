@@ -1421,6 +1421,27 @@ def plot_grad_cos_variance(gres, title='', save_path=None):
 # 现采掩码 -> 蒙后输入，成本低两个量级，适合跨任务跨 ckpt 批量出图。
 MASK_VIZ_VERSION = 1      # notebook 断言用
 
+# 图内中文的运行时字体探测：服务器无 CJK 字体时自动切英文（避免豆腐块）
+_CJK_FONTS = ('Noto Sans CJK SC', 'Source Han Sans SC', 'WenQuanYi Zen Hei',
+              'Microsoft YaHei', 'SimHei', 'Droid Sans Fallback',
+              'AR PL UMing CN', 'PingFang SC')
+_cjk = None
+
+
+def _cjk_available():
+    global _cjk
+    if _cjk is None:
+        from matplotlib import font_manager
+        names = {f.name for f in font_manager.fontManager.ttflist}
+        _cjk = any(n in names for n in _CJK_FONTS)
+        if not _cjk:
+            print('[probe_core] 系统无 CJK 字体，图中的中文自动切换为英文')
+    return _cjk
+
+
+def _zh(cn, en):
+    return cn if _cjk_available() else en
+
 
 def img01_from_xis(xis, mean=IMAGENET_MEAN, std=IMAGENET_STD, scale=255.0):
     """归一化输入 list -> [0,1] 图像 list（展示用）。逐图处理，不要求同尺寸。"""
@@ -1632,9 +1653,10 @@ def plot_mask_viz_evolution(res_list, labels, mode='masked', max_images=4,
             if c == 0:
                 ax.set_ylabel(labels[r], fontsize=9, rotation=0,
                               ha='right', va='center')
-    supt = {'masked': '蒙后输入 x̃ 随训练演化',
-            'prob': '掩码采样概率随训练演化',
-            'g': 'G 热力随训练演化'}[mode]
+    supt = {'masked': _zh('蒙后输入 x~ 随训练演化', 'masked input evolution'),
+            'prob': _zh('掩码采样概率随训练演化',
+                        'mask sampling prob evolution'),
+            'g': _zh('G 热力随训练演化', 'G heatmap evolution')}[mode]
     fig.suptitle(f'{supt} | {title}' if title else supt)
     fig.tight_layout()
     if save_path:
