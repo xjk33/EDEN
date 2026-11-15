@@ -1005,7 +1005,7 @@ def plot_ut_vs_meta(ut, mg=None, title='', save_path=None, keys=UT_KEYS):
                 ax2 = ax.twinx()
                 if mg_line:
                     ax2.plot(x_mg, mg['meta'], lw=1.8, color='tab:red',
-                             label='meta-grad <g_task, ĝ_diff> (unit-norm)')
+                             label='meta-grad <g_task, g_diff> (unit-norm)')
                     if 'meta_std' in mg:
                         ax2.fill_between(x_mg, mg['meta'] - mg['meta_std'],
                                          mg['meta'] + mg['meta_std'],
@@ -1014,7 +1014,7 @@ def plot_ut_vs_meta(ut, mg=None, title='', save_path=None, keys=UT_KEYS):
                 else:
                     ax2.plot(x_mg, mg['meta'], lw=2, marker='o', ms=4,
                              color='tab:red',
-                             label='meta-grad <g_task, ĝ_diff> (unit-norm)')
+                             label='meta-grad <g_task, g_diff> (unit-norm)')
                 ax2.set_ylabel('meta gradient (unit-norm)', color='tab:red')
                 lines = ax.get_lines() + ax2.get_lines()
                 ax.legend(lines, [l.get_label() for l in lines], fontsize=8)
@@ -1130,7 +1130,7 @@ def plot_ut_montage(panels, ks, x_axis='logsnr', with_meta=True,
             if ri == 0:
                 ax.set_title(f'k={k:g}', fontsize=11)
             if ci == 0:
-                ax.set_ylabel(f"{p['tag']}\nμ(t)", fontsize=9)
+                ax.set_ylabel(f"{p['tag']}\nmu(t)", fontsize=9)
             if ri == n_r - 1:
                 ax.set_xlabel(xlab, fontsize=9)
     if title:
@@ -1152,7 +1152,7 @@ def plot_tweight(snap, title='', ts_freq=None, save_path=None):
                         (axes[1], logsnr, 'log SNR (bin rep)')]:
         ax.bar(x, w, width=(x[1] - x[0]) * 0.7 if K > 1 else 10,
                alpha=0.7, label='t_weight')
-        ax.plot(x, d_n, color='tab:red', marker='o', ms=3, label='μ̄ table (scaled)')
+        ax.plot(x, d_n, color='tab:red', marker='o', ms=3, label='mu table (scaled)')
         if ts_freq is not None:
             ax.plot(x, ts_freq, color='tab:green', marker='s', ms=3, lw=1.8,
                     label='realized t freq')
@@ -1234,7 +1234,7 @@ def plot_mask_meta(res, title='', save_path=None, max_images=None, mask_alpha=1.
         axes[i, 0].set_title('image', fontsize=10)
         ip_pos = np.clip(ip[i, 0], 0, None)              # 正部：只有正贡献参与选址
         im1 = axes[i, 1].imshow(ip_pos, cmap='turbo')
-        axes[i, 1].set_title('meta IP ⟨g_task, g_den⟩ (pos)', fontsize=10)
+        axes[i, 1].set_title('meta IP <g_task, g_den> (pos)', fontsize=10)
         fig.colorbar(im1, ax=axes[i, 1], fraction=0.046)
         im2 = axes[i, 2].imshow(gb[i, 0], cmap='turbo')
         axes[i, 2].set_title(
@@ -1245,16 +1245,16 @@ def plot_mask_meta(res, title='', save_path=None, max_images=None, mask_alpha=1.
         col = 3
         if mk_ip is not None:
             axes[i, 3].imshow(_soft_overlay(im0, mk_ip[i, 0]))
-            axes[i, 3].set_title(f'IP-mask x̃₀ (α={mask_alpha:g}, '
+            axes[i, 3].set_title(f'IP-mask x~0 (alpha={mask_alpha:g}, '
                                  f'masked={1 - mk_ip[i, 0].mean():.2f})',
                                  fontsize=10)
             col = 4
             a, b = 1.0 - mk[i, 0], 1.0 - mk_ip[i, 0]     # 蒙区 IoU
             union = np.clip((a + b - a * b).sum(), 1e-12, None)
             iou = float((a * b).sum() / union)
-            g_title = f'G-mask x̃₀ (α={mask_alpha:g}, IoU={iou:.2f})'
+            g_title = f'G-mask x~0 (alpha={mask_alpha:g}, IoU={iou:.2f})'
         else:
-            g_title = (f'G-mask x̃₀ (α={mask_alpha:g}, '
+            g_title = (f'G-mask x~0 (alpha={mask_alpha:g}, '
                        f'masked={1 - mk[i, 0].mean():.2f})')
         axes[i, col].imshow(_soft_overlay(im0, mk[i, 0]))
         axes[i, col].set_title(g_title, fontsize=10)
@@ -1267,8 +1267,8 @@ def plot_mask_meta(res, title='', save_path=None, max_images=None, mask_alpha=1.
     return fig
 
 
-ARM_LABELS = {'arm_a': 'A: 仅 ε 随机', 'arm_b': 'B: 仅 x₀ 随机',
-              'arm_c': 'C: 皆随机(总)'}
+ARM_LABELS = {'arm_a': 'A: eps only', 'arm_b': 'B: x0 only',
+              'arm_c': 'C: both (total)'}
 ARM_COLORS = {'arm_a': 'tab:orange', 'arm_b': 'tab:green', 'arm_c': 'tab:blue'}
 
 
@@ -1301,7 +1301,7 @@ def plot_loss_variance(res, title='', save_path=None):
     ax.plot(t, c['l0_mean'], color='tab:gray', lw=2, label='mean L(zero)')
     ax.plot(t, c['lz_mean'], color='tab:blue', lw=2, label='mean L(z_sem)')
     ax.set_yscale('log')
-    ax.set_title('loss 量级随 t 增长 ⇒ 原始方差必增（无效判据）', fontsize=10)
+    ax.set_title('loss scale grows with t => raw variance must grow (invalid criterion)', fontsize=10)
     ax.set_xlabel('t'); ax.set_ylabel('loss (log)')
     ax.grid(alpha=0.3); ax.legend(fontsize=8)
 
@@ -1309,9 +1309,9 @@ def plot_loss_variance(res, title='', save_path=None):
     ax = axes[0, 1]
     ax.plot(t, c['l0_cv'], color='tab:gray', lw=2, label='CV L(zero) [C]')
     ax.plot(t, c['lz_cv'], color='tab:blue', lw=2, label='CV L(z_sem) [C]')
-    ax.plot(t, a['lz_cv'], color='tab:orange', lw=1.2, ls='--', label='CV Lz [A:仅ε]')
-    ax.plot(t, b['lz_cv'], color='tab:green', lw=1.2, ls='--', label='CV Lz [B:仅x₀]')
-    ax.set_title('CV(loss) = std/|mean|（消除量纲后的真判据）', fontsize=10)
+    ax.plot(t, a['lz_cv'], color='tab:orange', lw=1.2, ls='--', label='CV Lz [A: eps only]')
+    ax.plot(t, b['lz_cv'], color='tab:green', lw=1.2, ls='--', label='CV Lz [B: x0 only]')
+    ax.set_title('CV(loss) = std/|mean| (scale-free criterion)', fontsize=10)
     ax.set_xlabel('t'); ax.set_ylabel('CV')
     ax.grid(alpha=0.3); ax.legend(fontsize=8)
 
@@ -1320,7 +1320,7 @@ def plot_loss_variance(res, title='', save_path=None):
     for arm in ('arm_a', 'arm_b', 'arm_c'):
         ax.plot(t, res[arm]['d_cv'], color=ARM_COLORS[arm], lw=2,
                 label=ARM_LABELS[arm])
-    ax.set_title('CV(D)（D 均值跨 0 处发散，仅参考）', fontsize=10)
+    ax.set_title('CV(D) (diverges where mean(D) crosses 0; reference only)', fontsize=10)
     ax.set_xlabel('t'); ax.set_ylabel('CV(D)')
     ax.grid(alpha=0.3); ax.legend(fontsize=8)
 
@@ -1330,21 +1330,21 @@ def plot_loss_variance(res, title='', save_path=None):
         ax.plot(t, np.abs(res[arm]['d_snr']), color=ARM_COLORS[arm], lw=2,
                 label=ARM_LABELS[arm])
     ax.plot(t, np.abs(c['gap_snr']), color='tab:red', lw=1.5, ls=':',
-            label='SNR(gap=‖p_z−p_c‖²) [C]（预测差诊断口径）')
-    ax.axhline(1.0, color='k', ls='--', lw=1, label='|SNR|=1（信号=噪声）')
-    ax.set_title('|SNR(D)| = |mean(D)|/std(D)——控制器实际吃到的信噪比', fontsize=10)
+            label='SNR(gap) [C] (pred-diff diagnostic)')
+    ax.axhline(1.0, color='k', ls='--', lw=1, label='|SNR|=1 (signal=noise)')
+    ax.set_title('|SNR(D)| = |mean(D)|/std(D) (SNR seen by the controller)', fontsize=10)
     ax.set_xlabel('t'); ax.set_ylabel('|SNR(D)|')
     ax.set_yscale('log')
     ax.grid(alpha=0.3); ax.legend(fontsize=8)
 
     # (1,1) 方差分解（与臂 A 同一图像集）
     ax = axes[1, 1]
-    ax.plot(t, dec['var_c'], color='tab:blue', lw=2, label='Var(D) 总 [C]')
-    ax.plot(t, dec['var_a'], color='tab:orange', lw=2, label='Var_ε [A]')
+    ax.plot(t, dec['var_c'], color='tab:blue', lw=2, label='Var(D) total [C]')
+    ax.plot(t, dec['var_a'], color='tab:orange', lw=2, label='Var_eps [A]')
     ax.plot(t, dec['var_b'], color='tab:green', lw=2, label='Var_x0 [B]')
     ax.plot(t, dec['interaction'], color='tab:red', lw=1.5, ls='--',
-            label='交互 (C−A−B)')
-    ax.set_title('Var(D) 分解：var_c ≈ var_a + var_b + 交互', fontsize=10)
+            label='interaction (C-A-B)')
+    ax.set_title('Var(D) decomposition: var_c ~ var_a + var_b + interaction', fontsize=10)
     ax.set_xlabel('t'); ax.set_ylabel('Var(D)')
     ax.grid(alpha=0.3); ax.legend(fontsize=8)
 
@@ -1352,7 +1352,7 @@ def plot_loss_variance(res, title='', save_path=None):
     ax = axes[1, 2]
     ax.plot(t, c['corr_l0_lz'], color='tab:purple', lw=2)
     ax.set_ylim(0, 1.02)
-    ax.set_title('corr(L0, Lz)：共享 x_t 的配对相关（Cov 是 D 方差小的主因）',
+    ax.set_title('corr(L0, Lz): paired corr via shared x_t (Cov explains small Var(D))',
                  fontsize=10)
     ax.set_xlabel('t'); ax.set_ylabel('Pearson r')
     ax.grid(alpha=0.3)
@@ -1404,7 +1404,7 @@ def plot_grad_cos_variance(gres, title='', save_path=None):
                    gres['cos_all'][ti], s=6, color='tab:gray', alpha=0.5)
     ax.axhline(0, color='k', ls='--', lw=0.8)
     ax.set_xlabel('t'); ax.set_ylabel('cos<g_task, g_diff>')
-    ax.set_title(title or '固定 t 下梯度方向一致性 cos 的分布')
+    ax.set_title(title or 'grad-direction cos distribution at fixed t')
     ax.grid(alpha=0.3); ax.legend(fontsize=8)
     fig.tight_layout()
     if save_path:
@@ -1420,27 +1420,6 @@ def plot_grad_cos_variance(gres, title='', save_path=None):
 # 内积，只做"这个 ckpt 当前会怎么蒙"的展示测量——G 热力 -> 块级采样概率 ->
 # 现采掩码 -> 蒙后输入，成本低两个量级，适合跨任务跨 ckpt 批量出图。
 MASK_VIZ_VERSION = 1      # notebook 断言用
-
-# 图内中文的运行时字体探测：服务器无 CJK 字体时自动切英文（避免豆腐块）
-_CJK_FONTS = ('Noto Sans CJK SC', 'Source Han Sans SC', 'WenQuanYi Zen Hei',
-              'Microsoft YaHei', 'SimHei', 'Droid Sans Fallback',
-              'AR PL UMing CN', 'PingFang SC')
-_cjk = None
-
-
-def _cjk_available():
-    global _cjk
-    if _cjk is None:
-        from matplotlib import font_manager
-        names = {f.name for f in font_manager.fontManager.ttflist}
-        _cjk = any(n in names for n in _CJK_FONTS)
-        if not _cjk:
-            print('[probe_core] 系统无 CJK 字体，图中的中文自动切换为英文')
-    return _cjk
-
-
-def _zh(cn, en):
-    return cn if _cjk_available() else en
 
 
 def img01_from_xis(xis, mean=IMAGENET_MEAN, std=IMAGENET_STD, scale=255.0):
@@ -1653,10 +1632,9 @@ def plot_mask_viz_evolution(res_list, labels, mode='masked', max_images=4,
             if c == 0:
                 ax.set_ylabel(labels[r], fontsize=9, rotation=0,
                               ha='right', va='center')
-    supt = {'masked': _zh('蒙后输入 x~ 随训练演化', 'masked input evolution'),
-            'prob': _zh('掩码采样概率随训练演化',
-                        'mask sampling prob evolution'),
-            'g': _zh('G 热力随训练演化', 'G heatmap evolution')}[mode]
+    supt = {'masked': 'masked input evolution',
+            'prob': 'mask sampling prob evolution',
+            'g': 'G heatmap evolution'}[mode]
     fig.suptitle(f'{supt} | {title}' if title else supt)
     fig.tight_layout()
     if save_path:

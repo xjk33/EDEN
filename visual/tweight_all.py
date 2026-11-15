@@ -222,37 +222,10 @@ def _stage_key(path):
 # =====================================================================
 # 绘图
 # =====================================================================
-_CJK_FONTS = ('Noto Sans CJK SC', 'Source Han Sans SC', 'WenQuanYi Zen Hei',
-              'Microsoft YaHei', 'SimHei', 'Droid Sans Fallback',
-              'AR PL UMing CN', 'PingFang SC')
-_cjk = None
-
-
-def _cjk_available():
-    """运行时探测系统有没有可用 CJK 字体（结果缓存）。"""
-    global _cjk
-    if _cjk is None:
-        from matplotlib import font_manager
-        names = {f.name for f in font_manager.fontManager.ttflist}
-        _cjk = any(n in names for n in _CJK_FONTS)
-        if not _cjk:
-            print('[tweight_all] 系统无 CJK 字体，图中的中文自动切换为英文')
-    return _cjk
-
-
-def _zh(cn, en):
-    """图内文字：有 CJK 字体用中文，否则用英文（避免豆腐块）。"""
-    return cn if _cjk_available() else en
-
-
 def _plt():
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
-    if _cjk_available():
-        matplotlib.rcParams['font.sans-serif'] = list(_CJK_FONTS) + [
-            'DejaVu Sans']
-        matplotlib.rcParams['axes.unicode_minus'] = False
     return plt
 
 
@@ -284,8 +257,7 @@ def plot_snapshot(snap, save_path=None):
     ax.plot(snap['grid_logsnr'], snap['grid_prob'], lw=1.8, color='tab:blue')
     ax.set_xlabel('log SNR')
     ax.set_ylabel('p(t)')
-    ax.set_title(_zh('训练网格上的采样概率 p(t)',
-                     'sampling prob p(t) on the training grid'), fontsize=10)
+    ax.set_title('sampling prob p(t) on the training grid', fontsize=10)
     ax.grid(alpha=0.3)
     fig.suptitle(f"{snap['tag']} | entropy={snap['entropy']:.3f} | "
                  f"max={w.max():.3f}@bin{int(w.argmax())}")
@@ -403,8 +375,8 @@ def plot_entropy_all(task_snaps, save_path=None):
         x = np.linspace(0, 1, len(snaps))
         ax.plot(x, [s['entropy'] for s in snaps], 'o-', ms=3,
                 label=TASKS[key]['name'])
-    ax.set_xlabel(_zh('训练进度（归一化）', 'training progress (normalized)'))
-    ax.set_ylabel(_zh('t_weight 归一化熵', 't_weight normalized entropy'))
+    ax.set_xlabel('training progress (normalized)')
+    ax.set_ylabel('t_weight normalized entropy')
     ax.set_ylim(0, 1.02)
     ax.grid(alpha=0.3)
     ax.legend(fontsize=8)
