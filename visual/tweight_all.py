@@ -292,6 +292,10 @@ def plot_montage(task_snaps, kind='pt', save_path=None):
     plt = _plt()
     keys = [k for k in TASKS if k in task_snaps and task_snaps[k]]
     n = len(keys)
+    if n == 0:
+        print('[plot_montage] 没有任何任务产出快照，跳过拼图'
+              '（请检查 TASKS 的 ckpt 路径）')
+        return None
     fig, axes = plt.subplots(n, 1, figsize=(8.5, 3.2 * n), squeeze=False)
     for r, key in enumerate(keys):
         ax = axes[r, 0]
@@ -318,6 +322,9 @@ def plot_montage(task_snaps, kind='pt', save_path=None):
 
 def plot_entropy_all(task_snaps, save_path=None):
     """四任务熵演化对比（x = 归一化训练进度，任务间 ckpt 数不同也能叠画）。"""
+    if not any(task_snaps.values()):
+        print('[plot_entropy_all] 没有任何任务产出快照，跳过')
+        return None
     plt = _plt()
     fig, ax = plt.subplots(figsize=(7.5, 4.4))
     for key, snaps in task_snaps.items():
@@ -383,12 +390,18 @@ def run_task(key):
 
 def main():
     ap = argparse.ArgumentParser(description='t 自适应采样概率可视化（四任务）')
-    ap.add_argument('tasks', nargs='*', default=list(TASKS),
-                    choices=list(TASKS), help='要跑的任务（默认全部）')
+    # 注意：nargs='*' 的位置参数不要同时给 default=list 和 choices——
+    # 不给参数时 argparse 会把 default 整个列表当单个值去校验 choices 而报错
+    ap.add_argument('tasks', nargs='*', default=None,
+                    help=f'要跑的任务（默认全部）：{list(TASKS)}')
     args = ap.parse_args()
+    keys = args.tasks or list(TASKS)
+    for k in keys:
+        if k not in TASKS:
+            ap.error(f'未知任务 {k!r}（可选：{list(TASKS)}）')
 
     task_snaps = {}
-    for key in args.tasks:
+    for key in keys:
         task_snaps[key] = run_task(key)
 
     montage_dir = os.path.join(OUT_ROOT, '_montage')
