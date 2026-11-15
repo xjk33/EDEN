@@ -1,0 +1,91 @@
+# EDEN 终版组合：TransReID ViT-S + DiffAE + t 自适应 + 结构化掩码（论文 3.2 + 3.3）
+# 与 vit_small_eden.yml 的差异仅在 EDEN 节点的两个开关；预热 W 步内 t 均匀采样
+# + 掩码均匀随机（同样块数、位置随机），预热结束两者同时启用引导（方案 3.4）。
+# 用法：python train_eden.py --config_file configs/msmt17/vit_small_eden_tweight_mask.yml
+MODEL:
+  PRETRAIN_PATH: '.../checkpoints/vit_small_cfs_lup.pth'
+  PRETRAIN_HW_RATIO: 2
+  METRIC_LOSS_TYPE: 'triplet'
+  IF_LABELSMOOTH: 'off'
+  IF_WITH_CENTER: 'no'
+  NAME: 'transformer'
+  NO_MARGIN: True
+  DEVICE_ID: ('1')
+  TRANSFORMER_TYPE: 'vit_small_patch16_224_TransReID'
+  STRIDE_SIZE: [16, 16]
+
+INPUT:
+  SIZE_TRAIN: [256, 128]
+  SIZE_TEST: [256, 128]
+  PROB: 0.5
+  RE_PROB: 0.5
+  PADDING: 10
+  PIXEL_MEAN: [0.5, 0.5, 0.5]
+  PIXEL_STD: [0.5, 0.5, 0.5]
+
+DATASETS:
+  NAMES: ('msmt17')
+  ROOT_DIR: ('/data')
+
+DATALOADER:
+  SAMPLER: 'softmax_triplet'
+  NUM_INSTANCE: 4
+  NUM_WORKERS: 8
+
+SOLVER:
+  OPTIMIZER_NAME: 'SGD'
+  MAX_EPOCHS: 240
+  BASE_LR: 0.0001
+  WARMUP_EPOCHS: 20
+  IMS_PER_BATCH: 128
+  WARMUP_METHOD: 'cosine'
+  LARGE_FC_LR: False
+  CHECKPOINT_PERIOD: 240
+  LOG_PERIOD: 20
+  EVAL_PERIOD: 20
+  WEIGHT_DECAY:  1e-4
+  WEIGHT_DECAY_BIAS: 1e-4
+  BIAS_LR_FACTOR: 2
+
+TEST:
+  EVAL: True
+  IMS_PER_BATCH: 256
+  RE_RANKING: False
+  WEIGHT: ''
+  NECK_FEAT: 'before'
+  FEAT_NORM: 'yes'
+
+OUTPUT_DIR: './log/transreid/msmt17/vit_small_eden_tweight_mask'
+
+EDEN:
+  ENABLED: True
+  IMAGE_SIZE: 128
+  ENC_OUTPUT_DIM: 384
+  COND_DIM: 384
+  DIT_SIZE: 'ti'
+  DIT_PATCH: 16
+  DIT_MLP_RATIO: 4.0
+  ADALN_HIDDEN_MULT: 0.25
+  NUM_DIFFUSION_TIMESTEPS: 1000
+  BETA_SCHEDULE: 'linear'
+  SPACED_TIMESTEPS: 'ddim100'
+  EMA_DECAY: 0.9999
+  LAMBDA_DIFF: 1.0
+  PRED_X0: True
+  # ---- t 自适应（3.2）----
+  T_WEIGHT_ENABLED: True
+  T_WEIGHT_WARMUP_ITERS: 5000    # W：预热步数（与掩码预热共用，3.4）
+  T_WEIGHT_BINS: 16              # K：logSNR 等频区间数
+  T_WEIGHT_INTERVAL: 500         # I：探针间隔（步）
+  T_WEIGHT_EMA: 0.95             # ρ：贡献度 EMA 系数
+  T_WEIGHT_PROBE_BATCH: 16       # B_p：每轮探针样本数
+  T_WEIGHT_K: 0.5                # k：不确定性惩罚系数（论文 k 消融最优）
+  T_WEIGHT_DELTA: 1e-3           # δ：量纲归一保护常数
+  # ---- 结构化掩码（3.3）----
+  MASK_ENABLED: True
+  MASK_PATCH: 16                 # 蒙块边长（128 图上 8×8 = 64 块）
+  MASK_RATIO: 0.25               # 数量限制：每图蒙 25% 的块（64 × 0.25 = 16 块）
+  MASK_ALPHA: 1.0                # 掩码强度：1 = 完全替换为均值色
+  # ---- 扩散分支独立优化器 ----
+  DIFF_LR: 1e-4
+  DIFF_WARMUP_EPOCHS: 8

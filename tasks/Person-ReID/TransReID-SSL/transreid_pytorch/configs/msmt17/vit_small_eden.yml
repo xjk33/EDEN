@@ -1,0 +1,96 @@
+# EDEN 基础臂：TransReID ViT-S + DiffAE 去噪约束（t 自适应关、结构化掩码关）
+# 任务侧（数据/增广/优化器/调度/epoch）全部继承 baseline vit_small.yml，不做任何修改。
+# 扩散侧与其他臂同一套配置：z_sem = global_feat（bottleneck 之前，384 维），
+# DiT-Ti 弱仪器 + x0 预测（I-DAE 形式），扩散分支独立 AdamW(1e-4) + 余弦。
+# 用法：python train_eden.py --config_file configs/msmt17/vit_small_eden.yml
+MODEL:
+  PRETRAIN_PATH: '.../checkpoints/vit_small_cfs_lup.pth'
+  PRETRAIN_HW_RATIO: 2
+  METRIC_LOSS_TYPE: 'triplet'
+  IF_LABELSMOOTH: 'off'
+  IF_WITH_CENTER: 'no'
+  NAME: 'transformer'
+  NO_MARGIN: True
+  DEVICE_ID: ('1')
+  TRANSFORMER_TYPE: 'vit_small_patch16_224_TransReID'
+  STRIDE_SIZE: [16, 16]
+
+INPUT:
+  SIZE_TRAIN: [256, 128]
+  SIZE_TEST: [256, 128]
+  PROB: 0.5
+  RE_PROB: 0.5
+  PADDING: 10
+  PIXEL_MEAN: [0.5, 0.5, 0.5]
+  PIXEL_STD: [0.5, 0.5, 0.5]
+
+DATASETS:
+  NAMES: ('msmt17')
+  ROOT_DIR: ('/data')
+
+DATALOADER:
+  SAMPLER: 'softmax_triplet'
+  NUM_INSTANCE: 4
+  NUM_WORKERS: 8
+
+SOLVER:
+  OPTIMIZER_NAME: 'SGD'
+  MAX_EPOCHS: 240
+  BASE_LR: 0.0001
+  WARMUP_EPOCHS: 20
+  IMS_PER_BATCH: 128
+  WARMUP_METHOD: 'cosine'
+  LARGE_FC_LR: False
+  CHECKPOINT_PERIOD: 240
+  LOG_PERIOD: 20
+  EVAL_PERIOD: 20
+  WEIGHT_DECAY:  1e-4
+  WEIGHT_DECAY_BIAS: 1e-4
+  BIAS_LR_FACTOR: 2
+
+TEST:
+  EVAL: True
+  IMS_PER_BATCH: 256
+  RE_RANKING: False
+  WEIGHT: ''
+  NECK_FEAT: 'before'
+  FEAT_NORM: 'yes'
+
+OUTPUT_DIR: './log/transreid/msmt17/vit_small_eden'
+
+# ---- EDEN 扩散分支（train_eden.py 以 set_new_allowed 合并本节点）----
+EDEN:
+  ENABLED: True
+  # ---- 扩散输入与条件 ----
+  IMAGE_SIZE: 128            # 任务图像（256×128）双线性缩到 128² 进扩散分支
+  ENC_OUTPUT_DIM: 384        # z_sem = global_feat（ViT-S：384）
+  COND_DIM: 384              # == ENC_OUTPUT_DIM，enc_compress 退化为 Identity
+  # ---- DiT 去噪器（弱仪器；表征已解耦到任务 encoder，仪器只做小）----
+  DIT_SIZE: 'ti'             # ~6.7M
+  DIT_PATCH: 16
+  DIT_MLP_RATIO: 4.0
+  ADALN_HIDDEN_MULT: 0.25
+  # ---- 扩散过程 ----
+  NUM_DIFFUSION_TIMESTEPS: 1000
+  BETA_SCHEDULE: 'linear'
+  SPACED_TIMESTEPS: 'ddim100'
+  EMA_DECAY: 0.9999
+  LAMBDA_DIFF: 1.0
+  PRED_X0: True              # x0 参数化（I-DAE 形式）
+  # ---- t 自适应（本臂关闭；参数为终版组合默认值）----
+  T_WEIGHT_ENABLED: False
+  T_WEIGHT_WARMUP_ITERS: 5000
+  T_WEIGHT_BINS: 16
+  T_WEIGHT_INTERVAL: 500
+  T_WEIGHT_EMA: 0.95
+  T_WEIGHT_PROBE_BATCH: 16
+  T_WEIGHT_K: 0.5
+  T_WEIGHT_DELTA: 1e-3
+  # ---- 结构化掩码（本臂关闭）----
+  MASK_ENABLED: False
+  MASK_PATCH: 16
+  MASK_RATIO: 0.25
+  MASK_ALPHA: 1.0
+  # ---- 扩散分支独立优化器 ----
+  DIFF_LR: 1e-4
+  DIFF_WARMUP_EPOCHS: 8      # ≈2000 it（MSMT17 bs128 约 255 it/ep），之后余弦退火到 0

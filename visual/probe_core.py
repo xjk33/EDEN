@@ -125,11 +125,37 @@ def build_val_batch(model, cfg, num_images=16):
             'xis': xis[:n], 'dsis': dsis[:n]}
 
 
+def _is_cls_wrapper(model):
+    """分类臂 wrapper（SwinV2WithDiffAE）：swin 子模块挂在 model.model 上，
+    无 mmseg 的 backbone / decode_head 结构。"""
+    return not hasattr(model, 'backbone') and hasattr(model, 'model')
+
+
+def _task_encoder_params(model):
+    """task 梯度作用对象（meta-grad / cos 方差测量的参数集）。
+    seg = backbone + 条件压缩层；cls = swin 子模块（'model.' 前缀，剔除分类头
+    model.head——与 seg 不含 decode_head 对齐）+ 条件压缩层。"""
+    def keep(n_):
+        if 'diffae_enc_compress' in n_ or 'backbone' in n_:
+            return True
+        return n_.startswith('model.') and not n_.startswith('model.head')
+    return [p for n_, p in model.named_parameters() if p.requires_grad and keep(n_)]
+
+
 def make_task_loss_fn(model, xis, dsis):
-    """下游任务 loss callable（带梯度）。当前为 seg 实现：decode head 训练 loss。"""
+    """下游任务 loss callable（带梯度），按 wrapper 类型自动分发：
+    seg：decode head 训练 loss，dsis = data_samples list；
+    cls：forward_features + head 的 CE，dsis = 0-dim long label list。
+    """
     n = len(xis)
+    is_cls = _is_cls_wrapper(model)
 
     def task_loss_fn():
+        if is_cls:
+            xs = torch.cat(xis, 0)
+            ys = torch.as_tensor([int(d) for d in dsis], device=xs.device)
+            logits = model.model.head(model.model.forward_features(xs))
+            return F.cross_entropy(logits, ys)
         losses = {}
         for i, xi in enumerate(xis):
             feats = model.backbone(xi)
@@ -325,8 +351,7 @@ def measure_meta_grad_spectrum(model, batch, n_t=32, n_subsets=4, n_noise=2,
     device = x.device
     N = x.shape[0]
 
-    params = [p for n_, p in model.named_parameters()
-              if p.requires_grad and ('backbone' in n_ or 'diffae_enc_compress' in n_)]
+    params = _task_encoder_params(model)
 
     # g_task：全图像池【分块】反传、累加梯度（参考系不再依赖少数图）。
     # 不能一次建全图计算图：64 张全分辨率图的图堆起来 ~38GB 直接 OOM；
@@ -571,10 +596,8 @@ def measure_mask_meta(model, batch, n_t=8, n_noise=2, mask_ratio=None, seed=0):
         xg = xi.detach().requires_grad_(True)
         with torch.enable_grad():
             # ---- g_task = ∂L_task/∂x₀（retain 图给后续 denoise 反传）----
-            feats = model.backbone(xg)
-            losses = model._decode_head_forward_train(feats, [dsi])
-            task = sum(v for k, v in losses.items()
-                       if isinstance(v, torch.Tensor) and 'loss' in k)
+            # 走 make_task_loss_fn：seg/cls 两路分发集中在一处
+            task = make_task_loss_fn(model, [xg], [dsi])()
             g_task = torch.autograd.grad(task, xg, retain_graph=True)[0].detach()
 
             # ---- g_den = ∂L_den/∂x₀，对 (t, ε) 逐次反传并累加逐像素内积 ----
@@ -879,8 +902,7 @@ def measure_grad_cos_variance(model, batch, n_t=16, n_noise=16, n_images=8,
     idx = np.unique(np.linspace(0, len(grid) - 1, n_t).round().astype(int))
     t_list = grid[idx]
 
-    params = [p for n_, p in model.named_parameters()
-              if p.requires_grad and ('backbone' in n_ or 'diffae_enc_compress' in n_)]
+    params = _task_encoder_params(model)
 
     # g_task：一次反传，固定
     task_loss = make_task_loss_fn(model, xis, dsis)()
