@@ -35,12 +35,22 @@ from utils.logger import setup_logger
 def _preregister_new_keys(cfg, yml_path):
     """旧版 yacs 兼容：新版可用 cfg.set_new_allowed(True) 放开未知键，
     旧版（无该 API 且 merge 时拒绝未知键）只能在合并前把 yml 中 cfg
-    尚未定义的键按原值预登记——值同源，后续 merge 不会触发类型冲突。"""
+    尚未定义的键预登记。yacs merge 时会对字符串做 literal_eval 解码
+    （'1e-3' -> 0.001），此处同样解码，保证类型一致不触发类型检查。"""
+    import ast
     import yaml
     from yacs.config import CfgNode as CN
 
     with open(yml_path, encoding='utf-8') as f:
         yml = yaml.safe_load(f)
+
+    def _decode(v):
+        if not isinstance(v, str):
+            return v
+        try:
+            return ast.literal_eval(v)
+        except (ValueError, SyntaxError):
+            return v
 
     def _ensure(node, d):
         for k, v in (d or {}).items():
@@ -49,7 +59,7 @@ def _preregister_new_keys(cfg, yml_path):
                     node[k] = CN()
                 _ensure(node[k], v)
             elif k not in node:
-                node[k] = v
+                node[k] = _decode(v)
 
     _ensure(cfg, yml)
 
