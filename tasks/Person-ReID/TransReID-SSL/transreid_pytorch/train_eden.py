@@ -32,6 +32,28 @@ from solver.scheduler_factory import create_scheduler
 from utils.logger import setup_logger
 
 
+def _preregister_new_keys(cfg, yml_path):
+    """旧版 yacs 兼容：新版可用 cfg.set_new_allowed(True) 放开未知键，
+    旧版（无该 API 且 merge 时拒绝未知键）只能在合并前把 yml 中 cfg
+    尚未定义的键按原值预登记——值同源，后续 merge 不会触发类型冲突。"""
+    import yaml
+    from yacs.config import CfgNode as CN
+
+    with open(yml_path, encoding='utf-8') as f:
+        yml = yaml.safe_load(f)
+
+    def _ensure(node, d):
+        for k, v in (d or {}).items():
+            if isinstance(v, dict):
+                if k not in node:
+                    node[k] = CN()
+                _ensure(node[k], v)
+            elif k not in node:
+                node[k] = v
+
+    _ensure(cfg, yml)
+
+
 def set_seed(seed):
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
@@ -53,10 +75,11 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    # 允许 yml 中的 EDEN 节点：新版 yacs 默认拒绝未知键需显式放开；
-    # 旧版 yacs 没有 set_new_allowed（默认就允许新键），跳过即可。
+    # 允许 yml 中的 EDEN 节点：新版 yacs 显式放开；旧版预登记新键。
     if hasattr(cfg, 'set_new_allowed'):
         cfg.set_new_allowed(True)
+    if args.config_file != '':
+        _preregister_new_keys(cfg, args.config_file)
     if args.config_file != "":
         cfg.merge_from_file(args.config_file)
     cfg.merge_from_list(args.opts)

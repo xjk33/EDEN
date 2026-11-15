@@ -69,7 +69,9 @@ def eden_kwargs_from_config(cfg) -> dict:
         t_weight_ema=e.T_WEIGHT_EMA,
         t_weight_probe_batch=e.T_WEIGHT_PROBE_BATCH,
         t_weight_k=e.T_WEIGHT_K,
-        t_weight_delta=e.T_WEIGHT_DELTA,
+        # yml 里写 1e-3 会被 YAML 1.1 解析成字符串（缺小数点）；
+        # 旧版 yacs merge 时会 literal_eval 解码回 float，此处 float() 是双保险
+        t_weight_delta=float(e.T_WEIGHT_DELTA),
     )
 
 
@@ -185,7 +187,8 @@ def build_eden_optimizers(cfg, model, center_criterion):
           f'diffae={sum(p.numel() for p in diffae_params) / 1e6:.1f}M params '
           f'(patterns={DIFFAE_PATTERNS})')
     optimizer_diffae = torch.optim.AdamW(
-        diffae_params, lr=cfg.EDEN.DIFF_LR, betas=(0.9, 0.999), weight_decay=0.0)
+        diffae_params, lr=float(cfg.EDEN.DIFF_LR), betas=(0.9, 0.999),
+        weight_decay=0.0)  # float()：yml 的 1e-4 可能是字符串（YAML 1.1）
     return optimizer_task, optimizer_diffae, optimizer_center
 
 
