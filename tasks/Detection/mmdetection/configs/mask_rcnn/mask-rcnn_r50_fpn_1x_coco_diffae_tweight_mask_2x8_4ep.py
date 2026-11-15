@@ -12,6 +12,10 @@
 #   configs/mask_rcnn/mask-rcnn_r50_fpn_1x_coco_diffae_tweight_mask_2x8_4ep.py 2
 _base_ = ['./mask-rcnn_r50_fpn_1x_coco_diffae_tweight_mask.py']
 
+# 多卡必需：原生 MMDDP.train_step 与 OptimWrapperDict 双优化器不兼容
+# （optim_context 未实现），换用 EDENDDP（单卡/单优化器时行为与原生一致）。
+model_wrapper_cfg = dict(type='EDENDistributedDataParallel')
+
 train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=4, val_interval=1)
 
 train_dataloader = dict(batch_size=8, num_workers=4)

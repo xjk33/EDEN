@@ -20,9 +20,10 @@ from typing import List, Optional
 
 import torch
 import torch.nn.functional as F
+from mmengine.model import MMDistributedDataParallel
 from mmengine.optim import OptimWrapperDict
 from mmdet.models.detectors.mask_rcnn import MaskRCNN
-from mmdet.registry import (MODELS, OPTIM_WRAPPER_CONSTRUCTORS,
+from mmdet.registry import (MODEL_WRAPPERS, MODELS, OPTIM_WRAPPER_CONSTRUCTORS,
                             OPTIM_WRAPPERS, OPTIMIZERS)
 
 try:
@@ -95,6 +96,36 @@ class SplitOptimWrapperConstructor:
             wrappers[key] = OPTIM_WRAPPERS.build(
                 cfg, default_args=dict(optimizer=optimizer))
         return OptimWrapperDict(**wrappers)
+
+
+@MODEL_WRAPPERS.register_module(force=True)
+class EDENDistributedDataParallel(MMDistributedDataParallel):
+    """
+    支持 OptimWrapperDict（task + diffae 双优化器）的 DDP 包装。
+
+    原生 MMDDP.train_step 强制调用 optim_wrapper.optim_context()，而
+    OptimWrapperDict 未实现该方法（NotImplementedError）——单卡时走
+    BaseModel.train_step -> MaskRCNNWithDiffAE.train_step，不触发；
+    多卡 DDP 才会走到。本类对 OptimWrapperDict 复刻模型侧 train_step
+    的手动编排（单次前向、单次反传、各子优化器分别 step/zero_grad），
+    唯一区别是前向经 self._run_forward —— 走 DDP.__call__，reducer 的
+    bucket 标记与梯度同步行为与原生多卡路径一致。无梯度累积、无 AMP 时
+    optim_context 只是计数器重置，跳过无影响。单优化器时回退原生实现。
+
+    config 写法：model_wrapper_cfg = dict(type='EDENDistributedDataParallel')
+    """
+
+    def train_step(self, data, optim_wrapper):
+        if not isinstance(optim_wrapper, OptimWrapperDict):
+            return super().train_step(data, optim_wrapper)
+        data = self.module.data_preprocessor(data, True)
+        losses = self._run_forward(data, mode='loss')
+        parsed_loss, log_vars = self.module.parse_losses(losses)
+        next(iter(optim_wrapper.values())).backward(parsed_loss)
+        for wrapper in optim_wrapper.values():
+            wrapper.step()
+            wrapper.zero_grad()
+        return log_vars
 
 
 def _add_monitor_keys(losses, diff_out):
