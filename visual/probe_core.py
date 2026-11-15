@@ -1410,3 +1410,233 @@ def plot_grad_cos_variance(gres, title='', save_path=None):
     if save_path:
         fig.savefig(save_path, dpi=150)
     return fig
+
+
+
+# =====================================================================
+# 测量 7：结构化掩码可视化（轻量版，四任务通用）
+# =====================================================================
+# 与 mask_meta（测量 4，IP 金标准裁判）的区别：这里不碰去噪器、不算分块一阶
+# 内积，只做"这个 ckpt 当前会怎么蒙"的展示测量——G 热力 -> 块级采样概率 ->
+# 现采掩码 -> 蒙后输入，成本低两个量级，适合跨任务跨 ckpt 批量出图。
+MASK_VIZ_VERSION = 1      # notebook 断言用
+
+
+def img01_from_xis(xis, mean=IMAGENET_MEAN, std=IMAGENET_STD, scale=255.0):
+    """归一化输入 list -> [0,1] 图像 list（展示用）。逐图处理，不要求同尺寸。"""
+    device = xis[0].device
+    m = torch.tensor(mean, device=device).view(1, 3, 1, 1)
+    s = torch.tensor(std, device=device).view(1, 3, 1, 1)
+    return [((xi.detach() * s + m) / scale).clamp(0, 1) for xi in xis]
+
+
+def measure_mask_viz(model, batch, grad_fn, batch_grad=False, mask_ratio=None,
+                     guided=True, seed=0):
+    """
+    轻量化结构化掩码可视化测量——回答"这个 ckpt 当前会怎么蒙"。
+
+    与训练同口径：G = |∂L_task/∂x₀|（逐图，任务 loss 对输入的梯度）先
+    adaptive_avg_pool 到 image_size²（与各 adapter 训练路径一致），再划块取
+    均值 -> 逐图 softmax 得块级采样概率 -> Gumbel-top-k 无放回定量采
+    round(ratio·n) 块（与 MaskSelector 引导期同逻辑，复用 _gumbel_topk）。
+    掩码施加与 MaskApplier 同公式：x̃ = w⊙x + (1−w)⊙c，w = 1−α(1−m)，
+    c 为该图均值色（在 [0,1] 空间等价复算，展示用）。
+
+    Args:
+        model:      EDEN wrapper（用到 image_size / mask_selector / mask_applier）
+        batch:      dict，需含 'xis'（归一化输入 list，梯度测量用）与
+                    'img01'（[0,1] 图像 list 或 [N,3,H,W]，展示用）
+        grad_fn:    callable(xg, dsi) -> scalar task loss（对 xg 可微）；
+                    batch_grad=False 时逐图调用（dsi = 该图标签），适合变尺寸
+                    任务（seg）；batch_grad=True 时一次调用（xg = cat 后的
+                    [N,3,H,W]，dsi = 整批标签），适合同尺寸任务——reid 的
+                    triplet loss 必须走这条（单图无配对）
+        mask_ratio: 蒙块量覆盖；None = 模型配置值（未启用掩码/ratio=0 回退 0.25）
+        guided:     True = G 引导选址（展示训练后行为）；False = 均匀随机
+                    （预热期行为）
+        seed:       掩码采样的专用种子（CRN：跨 ckpt 同图同噪声，严格可比）
+    Returns: dict ——
+        img_s   [N,3,S,S]   [0,1] 图像（resize 到扩散网格 S²，与其他量对齐）
+        g_block [N,1,g,g]   块级 G（块内均值）
+        prob    [N,1,g,g]   块级采样概率 softmax(h)（guided=False 时均匀）
+        mask    [N,1,g,g]   keep-mask（1=保留，0=被蒙）
+        masked  [N,3,S,S]   蒙后输入 x̃（[0,1] 展示空间）
+        以及 S / g / k / ratio / alpha / masked_frac[N]
+    """
+    device = batch['xis'][0].device
+    xis, dsis = batch['xis'], batch['dsis']
+    img01 = batch['img01']
+    if torch.is_tensor(img01):
+        img01 = [img01[i:i + 1] for i in range(img01.shape[0])]
+    N = len(xis)
+    S = model.image_size
+    patch = model.mask_selector.patch
+    g = max(1, S // patch)
+    sel = model.mask_selector
+    ratio = mask_ratio if mask_ratio is not None else (
+        sel.ratio if (sel.enabled and sel.ratio > 0) else 0.25)
+    k = max(1, int(round(ratio * g * g)))
+    alpha = float(model.mask_applier.alpha)
+
+    # ---- G = |∂L_task/∂x₀|（eval 模式：BN 用 running stats、dropout 关）----
+    if batch_grad:
+        X = torch.cat(xis, 0).detach().requires_grad_(True)
+        loss = grad_fn(X, dsis)
+        g_all = torch.autograd.grad(loss, X)[0].detach()
+        gmaps = [g_all[i:i + 1].abs().mean(dim=1, keepdim=True)
+                 for i in range(N)]
+    else:
+        gmaps = []
+        for xi, dsi in zip(xis, dsis):
+            xg = xi.detach().requires_grad_(True)
+            loss = grad_fn(xg, dsi)
+            gmaps.append(torch.autograd.grad(loss, xg)[0]
+                         .detach().abs().mean(dim=1, keepdim=True))
+
+    # ---- 块级概率 + 现采掩码（CRN：专用种子生成器按图序取数，跨 ckpt 同噪声）----
+    gen = torch.Generator().manual_seed(seed)
+    img_s, g_blocks, probs, keeps, maskeds = [], [], [], [], []
+    for i in range(N):
+        hm = F.adaptive_avg_pool2d(gmaps[i], (S, S))     # 与训练同：先池到 S²
+        h = F.adaptive_avg_pool2d(hm, (g, g))            # [1,1,g,g] 块内均值
+        logits = h.reshape(1, -1)
+        if guided:
+            prob = torch.softmax(logits, dim=1)
+        else:
+            prob = torch.full((1, g * g), 1.0 / (g * g), device=device)
+        u = torch.rand(1, g * g, generator=gen).to(device)
+        keep = _gumbel_topk(logits if guided else torch.zeros_like(logits),
+                            k, u).view(1, 1, g, g)
+        # 蒙后输入（MaskApplier 同公式，[0,1] 展示空间）
+        im = F.interpolate(img01[i].to(device), size=(S, S), mode='bilinear',
+                           align_corners=False)
+        m_up = keep.repeat_interleave(S // g, dim=2).repeat_interleave(S // g,
+                                                                       dim=3)
+        w = 1.0 - alpha * (1.0 - m_up)
+        c = im.mean(dim=(2, 3), keepdim=True)
+        masked = (w * im + (1.0 - w) * c).clamp(0, 1)
+        img_s.append(im)
+        g_blocks.append(h)
+        probs.append(prob.view(1, 1, g, g))
+        keeps.append(keep)
+        maskeds.append(masked)
+
+    keep_cat = torch.cat(keeps, 0)
+    return {'img_s': torch.cat(img_s, 0), 'g_block': torch.cat(g_blocks, 0),
+            'prob': torch.cat(probs, 0), 'mask': keep_cat,
+            'masked': torch.cat(maskeds, 0),
+            'S': S, 'g': g, 'k': k, 'ratio': ratio, 'alpha': alpha,
+            'masked_frac': (1.0 - keep_cat.float().mean(dim=(1, 2, 3)))
+            .cpu().numpy()}
+
+
+def save_mask_viz_cache(path, res):
+    """掩码可视化结果存 npz（复画免重测）。"""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    np.savez(path,
+             img_s=res['img_s'].cpu().numpy(),
+             g_block=res['g_block'].cpu().numpy(),
+             prob=res['prob'].cpu().numpy(),
+             mask=res['mask'].cpu().numpy(),
+             masked=res['masked'].cpu().numpy(),
+             masked_frac=res['masked_frac'],
+             meta=np.array([res['S'], res['g'], res['k'], res['ratio'],
+                            res['alpha']]))
+
+
+def load_mask_viz_cache(path):
+    """读回 save_mask_viz_cache 存的 npz。"""
+    z = np.load(path)
+    S, g, k, ratio, alpha = z['meta'].tolist()
+    return {'img_s': torch.from_numpy(z['img_s']),
+            'g_block': torch.from_numpy(z['g_block']),
+            'prob': torch.from_numpy(z['prob']),
+            'mask': torch.from_numpy(z['mask']),
+            'masked': torch.from_numpy(z['masked']),
+            'masked_frac': z['masked_frac'],
+            'S': int(S), 'g': int(g), 'k': int(k),
+            'ratio': float(ratio), 'alpha': float(alpha)}
+
+
+def plot_mask_viz(res, title='', save_path=None, max_images=None):
+    """单 ckpt 五联图：原图 | G 热力 | 采样概率 | keep-mask | 蒙后输入 x̃。
+
+    G 与概率都是块级量，nearest 插值显示块边界；mask 面板标题标实际蒙块数
+    k/n；x̃ 面板标题标蒙区占比（= ratio，采样定量）。
+    """
+    plt = _plt()
+    img = res['img_s'].cpu().numpy()
+    gb = res['g_block'].cpu().numpy()
+    pb = res['prob'].cpu().numpy()
+    mk = res['mask'].cpu().numpy()
+    msk = res['masked'].cpu().numpy()
+    n = img.shape[0] if max_images is None else min(max_images, img.shape[0])
+    n_col = 5
+    fig, axes = plt.subplots(n, n_col, figsize=(3.1 * n_col, 3.2 * n),
+                             squeeze=False)
+    for i in range(n):
+        axes[i, 0].imshow(img[i].transpose(1, 2, 0))
+        axes[i, 0].set_title('image', fontsize=10)
+        im1 = axes[i, 1].imshow(gb[i, 0], cmap='turbo', interpolation='nearest')
+        axes[i, 1].set_title('G = |dL_task/dx| (block)', fontsize=10)
+        fig.colorbar(im1, ax=axes[i, 1], fraction=0.046)
+        im2 = axes[i, 2].imshow(pb[i, 0], cmap='turbo', interpolation='nearest')
+        axes[i, 2].set_title('sampling prob softmax(h)', fontsize=10)
+        fig.colorbar(im2, ax=axes[i, 2], fraction=0.046)
+        axes[i, 3].imshow(1.0 - mk[i, 0], cmap='gray', interpolation='nearest',
+                          vmin=0, vmax=1)
+        axes[i, 3].set_title(f'masked blocks (k={res["k"]}/{res["g"]**2})',
+                             fontsize=10)
+        axes[i, 4].imshow(msk[i].transpose(1, 2, 0))
+        axes[i, 4].set_title(f'masked input (a={res["alpha"]:g}, '
+                             f'masked={res["masked_frac"][i]:.2f})',
+                             fontsize=10)
+        for j in range(n_col):
+            axes[i, j].axis('off')
+    fig.suptitle(title)
+    fig.tight_layout()
+    if save_path:
+        fig.savefig(save_path, dpi=150)
+    return fig
+
+
+def plot_mask_viz_evolution(res_list, labels, mode='masked', max_images=4,
+                            title='', save_path=None):
+    """跨 ckpt 演化拼图：行 = 训练阶段，列 = 同一批图（跨阶段固定，CRN）。
+
+    mode: 'masked' 蒙后输入 | 'prob' 采样概率 | 'g' G 热力。
+    概率/热力面板用共享色标范围（跨阶段可比：概率的动态范围变化本身就是现象）。
+    """
+    plt = _plt()
+    key = {'masked': 'masked', 'prob': 'prob', 'g': 'g_block'}[mode]
+    n_r, n_c = len(res_list), min(max_images, res_list[0]['img_s'].shape[0])
+    fig, axes = plt.subplots(n_r, n_c, figsize=(3.0 * n_c, 3.0 * n_r + 0.6),
+                             squeeze=False)
+    vmin, vmax = None, None
+    if mode in ('prob', 'g'):
+        allv = np.concatenate([r[key].cpu().numpy().ravel()
+                               for r in res_list])
+        vmin, vmax = float(allv.min()), float(allv.max())
+    for r, res in enumerate(res_list):
+        for c in range(n_c):
+            ax = axes[r, c]
+            v = res[key][c, 0].cpu().numpy() if mode != 'masked' else None
+            if mode == 'masked':
+                ax.imshow(res['masked'][c].cpu().numpy().transpose(1, 2, 0))
+            else:
+                ax.imshow(v, cmap='turbo', interpolation='nearest',
+                          vmin=vmin, vmax=vmax)
+            ax.axis('off')
+            if r == 0 and mode == 'masked':
+                ax.set_title(f'img {c}', fontsize=9)
+            if c == 0:
+                ax.set_ylabel(labels[r], fontsize=9, rotation=0,
+                              ha='right', va='center')
+    supt = {'masked': '蒙后输入 x̃ 随训练演化',
+            'prob': '掩码采样概率随训练演化',
+            'g': 'G 热力随训练演化'}[mode]
+    fig.suptitle(f'{supt} | {title}' if title else supt)
+    fig.tight_layout()
+    if save_path:
+        fig.savefig(save_path, dpi=150, bbox_inches='tight')
+    return fig
