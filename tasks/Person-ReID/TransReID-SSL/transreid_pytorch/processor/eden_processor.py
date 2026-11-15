@@ -68,6 +68,7 @@ def do_train_eden(cfg,
         acc_meter.reset()
         evaluator.reset()
         model.train()
+        log_time = time.time()  # 日志窗口计时起点（算 s/it 与 ETA）
         for n_iter, (img, vid, target_cam, target_view) in enumerate(train_loader):
             optimizer.zero_grad()
             optimizer_diffae.zero_grad()
@@ -105,13 +106,22 @@ def do_train_eden(cfg,
             torch.cuda.synchronize()
             if (not cfg.MODEL.DIST_TRAIN) or dist.get_rank() == 0:
                 if (n_iter + 1) % log_period == 0:
+                    now = time.time()
+                    iter_time = (now - log_time) / log_period
+                    log_time = now
+                    total_iters = epochs * len(train_loader)
+                    done_iters = (epoch - 1) * len(train_loader) + (n_iter + 1)
+                    eta = time.strftime('%H:%M:%S', time.gmtime(
+                        iter_time * (total_iters - done_iters)))
                     base_lr = scheduler._get_lr(epoch)[0] if cfg.SOLVER.WARMUP_METHOD == 'cosine' else scheduler.get_lr()[0]
                     logger.info(
                         "Epoch[{}] Iter[{}/{}] Loss: {:.3f}, LossDiff: {:.3f}, Acc: {:.3f}, "
-                        "Base Lr: {:.2e}, Diff Lr: {:.2e}, tw_ent: {}, zsem_std: {}"
+                        "Base Lr: {:.2e}, Diff Lr: {:.2e}, Time: {:.3f}s/it, ETA: {}, "
+                        "tw_ent: {}, zsem_std: {}"
                         .format(epoch, (n_iter + 1), len(train_loader),
                                 loss_meter.avg, loss_diff_meter.avg, acc_meter.avg,
                                 base_lr, optimizer_diffae.param_groups[0]['lr'],
+                                iter_time, eta,
                                 _v(losses, 'tw_ent'), _v(losses, 'zsem_std')))
 
         end_time = time.time()
