@@ -74,12 +74,17 @@ def build_cls_model(cfg_path, ckpt=None, device=None, data_path=None,
     if ckpt is not None:
         state = torch.load(ckpt, map_location='cpu')
         sd = state.get('model', state)
-        msg = model.load_state_dict(sd, strict=False)
+        # 注意：DiffAEMixin.load_state_dict 无返回值（pop EMA 键后调用
+        # super() 但丢弃 IncompatibleKeys），这里手动比对键集做报告。
+        model_keys = set(model.state_dict().keys())
+        model.load_state_dict(sd, strict=False)   # sd 原地被 pop 掉 EMA 键
+        fed = set(sd.keys())                      # 实际喂给模型的键
+        missing = sorted(model_keys - fed)
+        unexpected = sorted(fed - model_keys)
         print(f'[build_cls_model] loaded {os.path.basename(ckpt)} '
               f'(epoch {state.get("epoch", "?")}): '
-              f'missing={len(msg.missing_keys)} '
-              f'unexpected={len(msg.unexpected_keys)}')
-        for k in list(msg.missing_keys) + list(msg.unexpected_keys):
+              f'missing={len(missing)} unexpected={len(unexpected)}')
+        for k in missing + unexpected:
             print('   ', k)
     if device is None:
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
