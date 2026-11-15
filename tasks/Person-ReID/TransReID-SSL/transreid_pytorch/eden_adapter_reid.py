@@ -194,14 +194,17 @@ def build_eden_optimizers(cfg, model, center_criterion):
 
 def build_diffae_scheduler(cfg, optimizer_diffae):
     """diffae 分支调度：线性预热 DIFF_WARMUP_EPOCHS 个 epoch + 余弦退火到 0
-    （按 epoch step，与仓库原生 scheduler 节奏一致；与 cls/seg 臂同一形状）。"""
+    （按 epoch step，与仓库原生 scheduler 节奏一致；与 cls/seg 臂同一形状）。
+    用 LambdaLR 实现：reid 环境 torch<1.10，没有 LinearLR/SequentialLR。"""
+    import math
     warmup = cfg.EDEN.DIFF_WARMUP_EPOCHS
     total = cfg.SOLVER.MAX_EPOCHS
-    schedulers = [
-        lr_scheduler.LinearLR(optimizer_diffae, start_factor=1e-3,
-                              total_iters=warmup),
-        lr_scheduler.CosineAnnealingLR(optimizer_diffae,
-                                       T_max=total - warmup, eta_min=0.0),
-    ]
-    return lr_scheduler.SequentialLR(optimizer_diffae, schedulers,
-                                     milestones=[warmup])
+
+    def lr_lambda(epoch):
+        if epoch < warmup:
+            # 与 LinearLR(start_factor=1e-3, total_iters=warmup) 同轨迹
+            return 1e-3 + (1.0 - 1e-3) * epoch / max(warmup, 1)
+        p = min((epoch - warmup) / max(total - warmup, 1), 1.0)
+        return 0.5 * (1.0 + math.cos(math.pi * p))
+
+    return lr_scheduler.LambdaLR(optimizer_diffae, lr_lambda)
