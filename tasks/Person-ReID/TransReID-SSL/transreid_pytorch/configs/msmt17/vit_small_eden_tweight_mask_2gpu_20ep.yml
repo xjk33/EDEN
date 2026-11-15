@@ -1,0 +1,102 @@
+# 快速验证版：TransReID ViT-S + DiffAE + t 自适应 + 结构化掩码
+# 目标规模：2 卡 DDP × bs=128（全局 256），20 epochs，约 5.5-6h 跑完。
+# 与全量版（vit_small_eden_tweight_mask.yml，单卡 240ep）的差异仅在训练规模：
+#   1. DIST_TRAIN=True 双卡；DEVICE_ID 两个卡（脚本用它设 CUDA_VISIBLE_DEVICES，
+#      写单卡会把 DDP 锁死）；
+#   2. MAX_EPOCHS 240->20（稳态约 8.1 s/it，122 it/ep/rank × 20 ≈ 5.5h）；
+#   3. 全局 bs 128->256，BASE_LR 线性 ×2（1e-4 -> 2e-4）；
+#   4. task warmup 20->2 ep（cosine 调度随 MAX_EPOCHS 自动缩放）；
+#   5. diffae warmup 8->1 ep；t_weight 预热 5000->200 it（等比，原值超过新总量）、
+#      探针间隔 500->250 it（保持约每 2 epoch 一次）；
+#   6. 评测只在最后（EVAL_PERIOD=20），ckpt 每 5 epoch 一个（共 4 个）。
+# 用法：
+#   python -m torch.distributed.launch --nproc_per_node=2 --master_port=66666 \
+#       train_eden.py --config_file configs/msmt17/vit_small_eden_tweight_mask_2gpu_20ep.yml
+MODEL:
+  PRETRAIN_PATH: 'checkpoints/vit_small_cfs_lup.pth'
+  PRETRAIN_HW_RATIO: 2
+  METRIC_LOSS_TYPE: 'triplet'
+  IF_LABELSMOOTH: 'off'
+  IF_WITH_CENTER: 'no'
+  NAME: 'transformer'
+  NO_MARGIN: True
+  DEVICE_ID: ('0,1')
+  TRANSFORMER_TYPE: 'vit_small_patch16_224_TransReID'
+  STRIDE_SIZE: [16, 16]
+  DIST_TRAIN: True
+
+INPUT:
+  SIZE_TRAIN: [256, 128]
+  SIZE_TEST: [256, 128]
+  PROB: 0.5
+  RE_PROB: 0.5
+  PADDING: 10
+  PIXEL_MEAN: [0.5, 0.5, 0.5]
+  PIXEL_STD: [0.5, 0.5, 0.5]
+
+DATASETS:
+  NAMES: ('msmt17')
+  ROOT_DIR: ('data')
+
+DATALOADER:
+  SAMPLER: 'softmax_triplet'
+  NUM_INSTANCE: 4
+  NUM_WORKERS: 8
+
+SOLVER:
+  OPTIMIZER_NAME: 'SGD'
+  MAX_EPOCHS: 20
+  BASE_LR: 0.0002
+  WARMUP_EPOCHS: 2
+  IMS_PER_BATCH: 128
+  WARMUP_METHOD: 'cosine'
+  LARGE_FC_LR: False
+  CHECKPOINT_PERIOD: 5
+  LOG_PERIOD: 20
+  EVAL_PERIOD: 20
+  WEIGHT_DECAY:  1e-4
+  WEIGHT_DECAY_BIAS: 1e-4
+  BIAS_LR_FACTOR: 2
+
+TEST:
+  EVAL: True
+  IMS_PER_BATCH: 256
+  RE_RANKING: False
+  WEIGHT: ''
+  NECK_FEAT: 'before'
+  FEAT_NORM: 'yes'
+
+OUTPUT_DIR: './log/transreid/msmt17/vit_small_eden_tweight_mask_2gpu_20ep'
+
+EDEN:
+  ENABLED: True
+  IMAGE_SIZE: 128
+  ENC_OUTPUT_DIM: 384
+  COND_DIM: 384
+  DIT_SIZE: 'ti'
+  DIT_PATCH: 16
+  DIT_MLP_RATIO: 4.0
+  ADALN_HIDDEN_MULT: 0.25
+  NUM_DIFFUSION_TIMESTEPS: 1000
+  BETA_SCHEDULE: 'linear'
+  SPACED_TIMESTEPS: 'ddim100'
+  EMA_DECAY: 0.9999
+  LAMBDA_DIFF: 1.0
+  PRED_X0: True
+  # ---- t 自适应（3.2）----
+  T_WEIGHT_ENABLED: True
+  T_WEIGHT_WARMUP_ITERS: 200     # W：等比缩（全量 5000 / 58320 it，现总量 2440 it）
+  T_WEIGHT_BINS: 16              # K：logSNR 等频区间数
+  T_WEIGHT_INTERVAL: 250         # I：约每 2 epoch 一探针（与全量版节奏一致）
+  T_WEIGHT_EMA: 0.95             # ρ：贡献度 EMA 系数
+  T_WEIGHT_PROBE_BATCH: 16       # B_p：每轮探针样本数
+  T_WEIGHT_K: 0.5                # k：不确定性惩罚系数（论文 k 消融最优）
+  T_WEIGHT_DELTA: 1e-3           # δ：量纲归一保护常数
+  # ---- 结构化掩码（3.3）----
+  MASK_ENABLED: True
+  MASK_PATCH: 16                 # 蒙块边长（128 图上 8×8 = 64 块）
+  MASK_RATIO: 0.25               # 数量限制：每图蒙 25% 的块（64 × 0.25 = 16 块）
+  MASK_ALPHA: 1.0                # 掩码强度：1 = 完全替换为均值色
+  # ---- 扩散分支独立优化器 ----
+  DIFF_LR: 1e-4
+  DIFF_WARMUP_EPOCHS: 1
