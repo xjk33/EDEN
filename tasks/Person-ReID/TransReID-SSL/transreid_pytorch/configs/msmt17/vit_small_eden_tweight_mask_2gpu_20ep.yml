@@ -4,7 +4,8 @@
 #   1. DIST_TRAIN=True 双卡；DEVICE_ID 两个卡（脚本用它设 CUDA_VISIBLE_DEVICES，
 #      写单卡会把 DDP 锁死）；
 #   2. MAX_EPOCHS 240->20（稳态约 8.1 s/it，122 it/ep/rank × 20 ≈ 5.5h）；
-#   3. 全局 bs 128->256，BASE_LR 线性 ×2（1e-4 -> 2e-4）；
+#   3. 全局 bs 不变：本仓库 DDP 约定 IMS_PER_BATCH 为全局 batch（每卡分 64），
+#      故 BASE_LR 维持 1e-4 不缩放；
 #   4. task warmup 20->2 ep（cosine 调度随 MAX_EPOCHS 自动缩放）；
 #   5. diffae warmup 8->1 ep；t_weight 预热 5000->200 it（等比，原值超过新总量）、
 #      探针间隔 500->250 it（保持约每 2 epoch 一次）；
@@ -46,7 +47,7 @@ DATALOADER:
 SOLVER:
   OPTIMIZER_NAME: 'SGD'
   MAX_EPOCHS: 20
-  BASE_LR: 0.0002
+  BASE_LR: 0.0001
   WARMUP_EPOCHS: 2
   IMS_PER_BATCH: 128
   WARMUP_METHOD: 'cosine'
