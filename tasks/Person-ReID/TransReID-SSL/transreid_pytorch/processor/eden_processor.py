@@ -5,7 +5,7 @@ EDEN 训练循环（TransReID）：由 processor.do_train 改写，差异点：
     fuse_parameters）；
   - 双优化器：task（仓库原生）+ diffae（AdamW 独立调度），单次前向、单次反传、
     各自 step；
-  - 任务损失经 wrapper 的 criterion 通道传入（原仓库 loss_func 的 ploss 位补 0），
+  - 任务损失经 wrapper 的 criterion 通道传入（即仓库原生 loss_func），
     返回 (losses dict, score)；loss = loss_task + loss_diffae；
   - 监控标量（tw_*/zsem_std/ts_mean）随日志记录，不参与求和。
 
@@ -58,10 +58,8 @@ def do_train_eden(cfg,
     evaluator = R1_mAP_eval(num_query, max_rank=50, feat_norm=cfg.TEST.FEAT_NORM)
     scaler = amp.GradScaler()
 
-    # 任务损失适配：原仓库 loss_func(score, feat, target, target_cam, ploss)
-    # 的 ploss 位（DenoiseRep 项）补 0，等价于原版任务损失
-    def task_criterion(score, feat, target, target_cam):
-        return loss_fn(score, feat, target, target_cam, 0)
+    # 任务损失即仓库原生 loss_func(score, feat, target, target_cam)
+    task_criterion = loss_fn
 
     for epoch in range(1, epochs + 1):
         start_time = time.time()

@@ -28,7 +28,6 @@ from optimizer import build_optimizer
 from logger import create_logger
 from utils import load_checkpoint, load_pretrained, save_checkpoint, NativeScalerWithGradNormCount, auto_resume_helper, \
     reduce_tensor
-from denoiserep import convert_vit_denoise_linear, count_vit_linear_layers, get_ploss, fuse_parameters, freeze_denoise_layers, unfreeze_denoise_layers
 
 # pytorch major version (1.x or 2.x)
 PYTORCH_MAJOR_VERSION = int(torch.__version__.split('.')[0])
@@ -118,8 +117,6 @@ def main(config):
         acc1, acc5, loss = validate(config, data_loader_val, model)
         logger.info(f"Accuracy of the network on the {len(dataset_val)} test images: {acc1:.1f}%")
 
-    layer_num = count_vit_linear_layers(model)
-    model = convert_vit_denoise_linear(model, layer_num)
     model.to(device)
     model_without_ddp = model
     
@@ -156,17 +153,11 @@ def main(config):
     logger.info("Start training")
     start_time = time.time()
     for epoch in range(config.TRAIN.START_EPOCH, config.TRAIN.EPOCHS):
-        if (epoch % config.TRAIN.FT_EPOCH == 0):
-            if ((epoch / config.TRAIN.FT_EPOCH) % 2):
-                freeze_denoise_layers(model)
-            else:
-                unfreeze_denoise_layers(model)
         data_loader_train.sampler.set_epoch(epoch)
 
         train_one_epoch(config, model, criterion, data_loader_train, optimizer, epoch, mixup_fn, lr_scheduler,
                         loss_scaler)
         if dist.get_rank() == 0 and (epoch % config.SAVE_FREQ == 0 or epoch == (config.TRAIN.EPOCHS - 1)):
-            model_without_ddp = fuse_parameters(model_without_ddp)
             save_checkpoint(config, epoch, model_without_ddp, max_accuracy, optimizer, lr_scheduler, loss_scaler,
                             logger)
 
@@ -201,9 +192,8 @@ def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, mix
 
         with torch.cuda.amp.autocast(enabled=config.AMP_ENABLE):
             outputs = model(samples)
-        ploss = get_ploss(model)
         loss = criterion(outputs, targets)
-        loss = loss / config.TRAIN.ACCUMULATION_STEPS + config.MODEL.DIFFUSION_LOSS_WEIGHT * ploss
+        loss = loss / config.TRAIN.ACCUMULATION_STEPS
 
         # this attribute is added by timm on one optimizer (adahessian)
         is_second_order = hasattr(optimizer, 'is_second_order') and optimizer.is_second_order

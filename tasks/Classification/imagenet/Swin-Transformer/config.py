@@ -126,7 +126,6 @@ _C.MODEL.SWIN_MOE.COSINE_ROUTER_DIM = 256
 _C.MODEL.SWIN_MOE.COSINE_ROUTER_INIT_T = 0.5
 _C.MODEL.SWIN_MOE.MOE_DROP = 0.0
 _C.MODEL.SWIN_MOE.AUX_LOSS_WEIGHT = 0.01
-_C.MODEL.DIFFUSION_LOSS_WEIGHT = 0.01
 
 # Swin MLP parameters
 _C.MODEL.SWIN_MLP = CN()
@@ -194,7 +193,6 @@ _C.EDEN.DIFF_WARMUP_ITERS = 2000       # LinearLR warmup 步数，之后余弦�
 # Training settings
 # -----------------------------------------------------------------------------
 _C.TRAIN = CN()
-_C.TRAIN.FT_EPOCH = 10
 _C.TRAIN.START_EPOCH = 0
 _C.TRAIN.EPOCHS = 120
 _C.TRAIN.WARMUP_EPOCHS = 20

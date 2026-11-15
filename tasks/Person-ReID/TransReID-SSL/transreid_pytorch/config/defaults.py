@@ -39,7 +39,6 @@ _C.MODEL.IF_WITH_CENTER = 'no'
 _C.MODEL.ID_LOSS_TYPE = 'softmax'
 _C.MODEL.ID_LOSS_WEIGHT = 1.0
 _C.MODEL.TRIPLET_LOSS_WEIGHT = 1.0
-_C.MODEL.DIFFUSION_LOSS_WEIGHT = 0.1
 
 _C.MODEL.METRIC_LOSS_TYPE = 'triplet'
 # If train with multi-gpu ddp mode, options: 'True', 'False'
@@ -180,7 +179,6 @@ _C.SOLVER.TRP_L2 = False
 # TRAIN
 # ---------------------------------------------------------------------------- #
 _C.TRAIN = CN()
-_C.TRAIN.FT_EPOCH = 10
 
 # ---------------------------------------------------------------------------- #
 # TEST

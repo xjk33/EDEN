@@ -6,7 +6,6 @@ from datasets import make_dataloader
 from model import make_model
 from processor import do_inference
 from utils.logger import setup_logger
-from denoiserep import fuse_parameters, count_vit_linear_layers, convert_vit_denoise_linear
 
 
 if __name__ == "__main__":
@@ -45,11 +44,7 @@ if __name__ == "__main__":
     train_loader, train_loader_normal, val_loader, num_query, num_classes, camera_num, view_num = make_dataloader(cfg)
 
     model = make_model(cfg, num_class=num_classes, camera_num=camera_num, view_num = view_num)
-    layer_num  = count_vit_linear_layers(model)
-    model = convert_vit_denoise_linear(model, layer_num)
     model.load_param(cfg.TEST.WEIGHT)
-    torch.save(model.state_dict(),
-                           os.path.join(cfg.OUTPUT_DIR, cfg.MODEL.NAME + '_denoise.pth'))
 
     if cfg.DATASETS.NAMES == 'VehicleID':
         for trial in range(10):
@@ -72,4 +67,3 @@ if __name__ == "__main__":
                  model,
                  val_loader,
                  num_query)
-

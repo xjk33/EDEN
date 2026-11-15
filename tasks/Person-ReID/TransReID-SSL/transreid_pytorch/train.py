@@ -12,7 +12,6 @@ import os
 import argparse
 from config import cfg
 import torch.distributed as dist
-from denoiserep import convert_vit_denoise_linear, count_vit_linear_layers, count_conv2d_layers, convert_denoise_conv2d
 
 def set_seed(seed):
     torch.manual_seed(seed)
@@ -40,7 +39,7 @@ if __name__ == '__main__':
     if args.config_file != "":
         cfg.merge_from_file(args.config_file)
     cfg.merge_from_list(args.opts)
-    
+
     cfg.freeze()
     set_seed(cfg.SOLVER.SEED)
 
@@ -72,13 +71,10 @@ if __name__ == '__main__':
     train_loader, train_loader_normal, val_loader, num_query, num_classes, camera_num, view_num = make_dataloader(cfg)
 
     model = make_model(cfg, num_class=num_classes, camera_num=camera_num, view_num = view_num)
-    model.load_param("/pretrain_model_path")
-    layer_num = count_vit_linear_layers(model) 
-    model = convert_vit_denoise_linear(model, layer_num, teacher_type=None)
-    model.to(device)  
-    loss_func, center_criterion = make_loss(cfg, num_classes=num_classes) 
-    optimizer, optimizer_center = make_optimizer(cfg, model, center_criterion) 
- 
+    model.to(device)
+    loss_func, center_criterion = make_loss(cfg, num_classes=num_classes)
+    optimizer, optimizer_center = make_optimizer(cfg, model, center_criterion)
+
     if cfg.SOLVER.WARMUP_METHOD == 'cosine':
         logger.info('===========using cosine learning rate=======')
         scheduler = create_scheduler(cfg, optimizer)
@@ -87,7 +83,7 @@ if __name__ == '__main__':
         scheduler = WarmupMultiStepLR(optimizer, cfg.SOLVER.STEPS, cfg.SOLVER.GAMMA,
                                       cfg.SOLVER.WARMUP_FACTOR,
                                       cfg.SOLVER.WARMUP_EPOCHS, cfg.SOLVER.WARMUP_METHOD)
-    
+
     do_train(
         cfg,
         model,

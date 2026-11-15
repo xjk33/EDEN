@@ -35,7 +35,7 @@ def make_loss(cfg, num_classes):    # modified by gu
 
     #  elif cfg.DATALOADER.SAMPLER in ['softmax_triplet', 'id_triplet', 'img_triplet']:
     elif 'triplet' in sampler:
-        def loss_func(score, feat, target, target_cam, ploss):
+        def loss_func(score, feat, target, target_cam):
             if cfg.MODEL.METRIC_LOSS_TYPE == 'triplet':
                 if cfg.MODEL.IF_LABELSMOOTH == 'on':
                     if isinstance(score, list):
@@ -53,8 +53,7 @@ def make_loss(cfg, num_classes):    # modified by gu
                             TRI_LOSS = triplet(feat, target, normalize_feature=cfg.SOLVER.TRP_L2)[0]
 
                     return cfg.MODEL.ID_LOSS_WEIGHT * ID_LOSS + \
-                               cfg.MODEL.TRIPLET_LOSS_WEIGHT * TRI_LOSS + \
-                                cfg.MODEL.DIFFUSION_LOSS_WEIGHT * ploss
+                               cfg.MODEL.TRIPLET_LOSS_WEIGHT * TRI_LOSS
                 else:
                     if isinstance(score, list):
                         ID_LOSS = [F.cross_entropy(scor, target) for scor in score[1:]]
@@ -71,8 +70,7 @@ def make_loss(cfg, num_classes):    # modified by gu
                             TRI_LOSS = triplet(feat, target, normalize_feature=cfg.SOLVER.TRP_L2)[0]
 
                     return cfg.MODEL.ID_LOSS_WEIGHT * ID_LOSS + \
-                               cfg.MODEL.TRIPLET_LOSS_WEIGHT * TRI_LOSS + \
-                                cfg.MODEL.DIFFUSION_LOSS_WEIGHT * ploss
+                               cfg.MODEL.TRIPLET_LOSS_WEIGHT * TRI_LOSS
             else:
                 print('expected METRIC_LOSS_TYPE should be triplet'
                       'but got {}'.format(cfg.MODEL.METRIC_LOSS_TYPE))

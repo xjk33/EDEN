@@ -7,7 +7,6 @@ from utils.meter import AverageMeter
 from utils.metrics import R1_mAP_eval
 from torch.cuda import amp
 import torch.distributed as dist
-from denoiserep import get_ploss, fuse_parameters, freeze_denoise_layers, unfreeze_denoise_layers
 
 def do_train(cfg,
              model,
@@ -41,13 +40,7 @@ def do_train(cfg,
     evaluator = R1_mAP_eval(num_query, max_rank=50, feat_norm=cfg.TEST.FEAT_NORM)
     scaler = amp.GradScaler()
     # train
-    unfreeze_denoise_layers(model)
     for epoch in range(1, epochs + 1):
-        if (epoch % cfg.TRAIN.FT_EPOCH == 0):
-            if ((epoch / cfg.TRAIN.FT_EPOCH) % 2):
-                freeze_denoise_layers(model)
-            else:
-                unfreeze_denoise_layers(model)
         start_time = time.time()
         loss_meter.reset()
         acc_meter.reset()
@@ -61,11 +54,10 @@ def do_train(cfg,
             target_cam = target_cam.to(device)
             target_view = target_view.to(device)
             with amp.autocast(enabled=True):
-                score, feat = model(img, target, cam_label=target_cam, view_label=target_view) 
-                ploss = get_ploss(model)  
-                loss = loss_fn(score, feat, target, target_cam, ploss) 
+                score, feat = model(img, target, cam_label=target_cam, view_label=target_view)
+                loss = loss_fn(score, feat, target, target_cam)
             scaler.scale(loss).backward()
-                
+
             scaler.step(optimizer)
             scaler.update()
             if 'center' in cfg.MODEL.METRIC_LOSS_TYPE:
@@ -107,7 +99,6 @@ def do_train(cfg,
                     .format(epoch, time_per_batch * (n_iter + 1), train_loader.batch_size / time_per_batch))
 
         if epoch % checkpoint_period == 0:
-            model = fuse_parameters(model)
             if cfg.MODEL.DIST_TRAIN:
                 if dist.get_rank() == 0:
                     torch.save(model.state_dict(),
@@ -117,7 +108,6 @@ def do_train(cfg,
                            os.path.join(cfg.OUTPUT_DIR, cfg.MODEL.NAME + '_{}.pth'.format(epoch)))
 
         if epoch % eval_period == 0:
-            model = fuse_parameters(model)
             if cfg.MODEL.DIST_TRAIN:
                 if dist.get_rank() == 0:
                     model.eval()
@@ -187,5 +177,3 @@ def do_inference(cfg,
     for r in [1, 5, 10]:
         logger.info("CMC curve, Rank-{:<3}:{:.1%}".format(r, cmc[r - 1]))
     return cmc[0], cmc[4]
-
-
