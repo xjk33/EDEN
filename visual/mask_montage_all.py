@@ -14,18 +14,22 @@ pc.measure_mask_viz 后用 pc.save_mask_viz_cache 存盘，本脚本只负责拼
     iter_8000_cache.npz 等             montage_masked.png / montage_prob.png
 
 图版式（与 montage_heat 一致的"一张图看懂"风格）：
-  行 = 任务；列 = [原图 | 早期 | 中期 | 晚期]。
+  行 = 任务；列 = [原图 | 早期 | 中期 | 晚期] —— 4 任务 × 4 列。
   每个任务内部用**同一张图**贯穿（image_idx 可配，跨阶段 CRN 同图同噪声），
   列标题标出该阶段对应的 ckpt tag。
+  - montage_g.png：     任务敏感度 G 热力演化（原图在最左列，论文主图）
   - montage_masked.png：蒙后输入 x~0（模型实际看到的退化图）
   - montage_prob.png：  块级采样概率热力（全部 cell 共享色标，跨任务可比）
 
 用法：
   1. 先在四个任务各自的环境里跑对应的 probe_mask_*.ipynb（产出 cache npz）；
-  2. 按需修改下面 TASKS 的 cache_dir / image_idx / stages；
-  3. python mask_montage_all.py            # 全部任务
+  2. 按需修改下面 TASKS 的 image_idx / STAGES，或用命令行覆盖；
+  3. python mask_montage_all.py            # 全部任务 × 三种模式
      python mask_montage_all.py seg det    # 只拼指定任务
-输出：OUT_DIR/montage_masked.png、OUT_DIR/montage_prob.png
+     python mask_montage_all.py --modes g  # 只出 G 演化图
+     python mask_montage_all.py --img cls=3 --img seg=1
+     python mask_montage_all.py --stages cls=ckpt_epoch_0,ckpt_epoch_6,ckpt_epoch_11
+输出：OUT_DIR/montage_{g,masked,prob}.png
 """
 import argparse
 import glob
@@ -179,7 +183,7 @@ def plot_mask_montage(task_panels, mode='masked', save_path=None, dpi=DPI):
             ax.axis('off')
         axes[r, 0].axis('off')
     if rows:
-        axes[0, 0].set_title('image', fontsize=9)
+        axes[0, 0].set_title('Original', fontsize=9)
     if im is not None:
         fig.colorbar(im, ax=axes.ravel().tolist(), fraction=0.02, pad=0.01)
     supt = {'masked': 'structured mask evolution (masked input)',
@@ -219,13 +223,35 @@ def main():
     ap = argparse.ArgumentParser(description='结构化掩码四任务拼图（论文用）')
     ap.add_argument('tasks', nargs='*', default=None,
                     help=f'要拼的任务（默认全部）：{list(TASKS)}')
+    ap.add_argument('--modes', nargs='*', default=['g', 'masked', 'prob'],
+                    choices=['g', 'masked', 'prob'],
+                    help='出哪些模式的图（默认全部三种）')
+    ap.add_argument('--img', action='append', default=[], metavar='TASK=IDX',
+                    help='覆盖某任务用第几张图，如 --img cls=3（可多次）')
+    ap.add_argument('--stages', action='append', default=[],
+                    metavar='TASK=EARLY,MID,LATE',
+                    help='覆盖某任务的三个 ckpt tag，如 '
+                         '--stages cls=ckpt_epoch_0,ckpt_epoch_6,ckpt_epoch_11'
+                         '（可多次）')
     args = ap.parse_args()
     keys = args.tasks or list(TASKS)
     for k in keys:
         if k not in TASKS:
             ap.error(f'未知任务 {k!r}（可选：{list(TASKS)}）')
 
-    for mode in ('masked', 'prob'):
+    for kv in args.img:
+        k, _, v = kv.partition('=')
+        if k not in TASKS or not v.isdigit():
+            ap.error(f'--img 格式应为 TASK=IDX，收到 {kv!r}')
+        TASKS[k]['image_idx'] = int(v)
+    for kv in args.stages:
+        k, _, v = kv.partition('=')
+        tags = v.split(',')
+        if k not in TASKS or len(tags) != 3:
+            ap.error(f'--stages 格式应为 TASK=EARLY,MID,LATE，收到 {kv!r}')
+        STAGES[k] = dict(zip(('early', 'mid', 'late'), tags))
+
+    for mode in args.modes:
         panels = [build_task_panel(k, mode) for k in keys]
         fig = plot_mask_montage(
             panels, mode=mode,
