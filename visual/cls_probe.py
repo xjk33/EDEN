@@ -92,7 +92,7 @@ def build_cls_val_batch(model, config, num_images=16, batch_size=16,
     返回与 seg 版 build_val_batch 同构的 dict（dsis = 逐图 label tensor）。
     """
     _ensure_swin_importable()
-    from data import build_dataset
+    from data.build import build_dataset   # data/__init__ 只导出 build_loader
 
     device = next(model.parameters()).device
     dataset_val, _ = build_dataset(is_train=False, config=config)

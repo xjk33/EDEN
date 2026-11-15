@@ -1600,6 +1600,59 @@ def plot_mask_viz(res, title='', save_path=None, max_images=None):
     return fig
 
 
+def plot_mask_montage(cells, row_labels, col_labels, mode='rgb', title='',
+                      save_path=None, cell=2.6, dpi=200):
+    """跨任务 × 跨阶段的掩码拼图（论文主图）：行 = 任务，列 = 阶段。
+
+    Args:
+        cells:      list[list[np.ndarray]]，cells[r][c] 为 RGB 图 [H,W,3]（0~1）
+                    （mode='rgb'）或灰度/热力图 [H,W]（mode='heat'）；
+                    None = 空位（该任务缺此阶段，留空）
+        row_labels: 行标题（任务名），列标题同理
+        mode:       'rgb' 直接 imshow；'heat' 用 turbo 色标且全图共享色标
+                    范围（跨任务/跨阶段可比——动态范围变化本身就是现象）
+    Returns: fig
+    """
+    plt = _plt()
+    n_r, n_c = len(cells), max(len(row) for row in cells)
+    fig, axes = plt.subplots(n_r, n_c,
+                             figsize=(cell * n_c, cell * n_r + 0.5),
+                             squeeze=False)
+    vmin = vmax = None
+    if mode == 'heat':
+        vals = np.concatenate([c.ravel() for row in cells for c in row
+                               if c is not None])
+        vmin, vmax = float(vals.min()), float(vals.max())
+    for r in range(n_r):
+        for c in range(n_c):
+            ax = axes[r, c]
+            img = cells[r][c] if c < len(cells[r]) else None
+            if img is None:
+                ax.axis('off')
+                continue
+            if mode == 'heat':
+                ax.imshow(img, cmap='turbo', interpolation='nearest',
+                          vmin=vmin, vmax=vmax)
+            else:
+                ax.imshow(np.clip(img, 0, 1))
+            ax.set_xticks([]); ax.set_yticks([])
+            for spine in ax.spines.values():
+                spine.set_visible(True)
+                spine.set_color('0.75')
+            if r == 0 and c < len(col_labels):
+                ax.set_title(col_labels[c], fontsize=9)
+            if c == 0 and r < len(row_labels):
+                ax.set_ylabel(row_labels[r], fontsize=9, rotation=0,
+                              ha='right', va='center')
+    if title:
+        fig.suptitle(title)
+    fig.tight_layout()
+    if save_path:
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        fig.savefig(save_path, dpi=dpi, bbox_inches='tight')
+    return fig
+
+
 def plot_mask_viz_evolution(res_list, labels, mode='masked', max_images=4,
                             title='', save_path=None):
     """跨 ckpt 演化拼图：行 = 训练阶段，列 = 同一批图（跨阶段固定，CRN）。
