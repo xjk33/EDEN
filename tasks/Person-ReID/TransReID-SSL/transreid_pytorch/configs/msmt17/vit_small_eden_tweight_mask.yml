@@ -3,7 +3,7 @@
 # + 掩码均匀随机（同样块数、位置随机），预热结束两者同时启用引导（方案 3.4）。
 # 用法：python train_eden.py --config_file configs/msmt17/vit_small_eden_tweight_mask.yml
 MODEL:
-  PRETRAIN_PATH: '.../checkpoints/vit_small_cfs_lup.pth'
+  PRETRAIN_PATH: 'checkpoints/vit_small_cfs_lup.pth'
   PRETRAIN_HW_RATIO: 2
   METRIC_LOSS_TYPE: 'triplet'
   IF_LABELSMOOTH: 'off'

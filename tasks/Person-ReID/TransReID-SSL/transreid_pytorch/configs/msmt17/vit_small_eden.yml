@@ -4,7 +4,7 @@
 # DiT-Ti 弱仪器 + x0 预测（I-DAE 形式），扩散分支独立 AdamW(1e-4) + 余弦。
 # 用法：python train_eden.py --config_file configs/msmt17/vit_small_eden.yml
 MODEL:
-  PRETRAIN_PATH: '.../checkpoints/vit_small_cfs_lup.pth'
+  PRETRAIN_PATH: 'checkpoints/vit_small_cfs_lup.pth'
   PRETRAIN_HW_RATIO: 2
   METRIC_LOSS_TYPE: 'triplet'
   IF_LABELSMOOTH: 'off'
