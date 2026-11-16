@@ -1286,7 +1286,8 @@ def plot_mask_meta(res, title='', save_path=None, max_images=None, mask_alpha=1.
         axes[i, col].set_title(g_title, fontsize=10)
         for j in range(n_col):
             axes[i, j].axis('off')
-    fig.suptitle(title)
+    if title:
+        fig.suptitle(title)
     fig.tight_layout()
     if save_path:
         fig.savefig(save_path, dpi=150)
