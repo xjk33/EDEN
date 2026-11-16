@@ -1425,7 +1425,7 @@ def plot_grad_cos_variance(gres, title='', save_path=None):
 # 与 mask_meta（测量 4，IP 金标准裁判）的区别：这里不碰去噪器、不算分块一阶
 # 内积，只做"这个 ckpt 当前会怎么蒙"的展示测量——G 热力 -> 块级采样概率 ->
 # 现采掩码 -> 蒙后输入，成本低两个量级，适合跨任务跨 ckpt 批量出图。
-MASK_VIZ_VERSION = 3      # notebook 断言用；3 = 引导概率与 MaskSelector 同公式 (h/h̄)/τ
+MASK_VIZ_VERSION = 4      # notebook 断言用；4 = 支持 GT 标注注入（ann_fn -> img_gt）
 
 
 def img01_from_xis(xis, mean=IMAGENET_MEAN, std=IMAGENET_STD, scale=255.0):
@@ -1436,8 +1436,125 @@ def img01_from_xis(xis, mean=IMAGENET_MEAN, std=IMAGENET_STD, scale=255.0):
     return [((xi.detach() * s + m) / scale).clamp(0, 1) for xi in xis]
 
 
+# =====================================================================
+# GT 标注助手：把任务标签画到展示图上（各任务 notebook 在测量时经
+# measure_mask_viz(ann_fn=...) 注入，结果 img_gt 随 npz 缓存——拼图脚本
+# mask_montage_all.py 保持零框架依赖，只读缓存）。
+# 约定：输入/输出均为 [3,H,W] 或 [1,3,H,W] 的 0~1 图像（tensor 或数组），
+# 返回 torch tensor [3,H,W]。
+# =====================================================================
+def _chw_to_np(img):
+    a = img.detach().cpu().numpy() if torch.is_tensor(img) else np.asarray(img)
+    if a.ndim == 4:
+        a = a[0]
+    return np.ascontiguousarray(a.transpose(1, 2, 0), dtype=np.float32)
+
+
+def _np_to_chw(a):
+    return torch.from_numpy(np.ascontiguousarray(a.transpose(2, 0, 1)))
+
+
+def _draw_text(a, text, org=(3, 3), fill=(255, 255, 255)):
+    """带黑底衬的文字（PIL 默认位图字体，环境只需 Pillow）。"""
+    from PIL import Image, ImageDraw
+    im = Image.fromarray((np.clip(a, 0, 1) * 255).astype(np.uint8))
+    dr = ImageDraw.Draw(im)
+    bb = dr.textbbox(org, text)
+    dr.rectangle([bb[0] - 2, bb[1] - 1, bb[2] + 2, bb[3] + 1], fill=(0, 0, 0))
+    dr.text(org, text, fill=fill)
+    return np.asarray(im, dtype=np.float32) / 255.0
+
+
+def annotate_cls(img, cls_idx, names=None):
+    """分类：左上角 'GT: name (idx)'（names=None 时只有 idx）。"""
+    a = _chw_to_np(img)
+    idx = int(cls_idx)
+    if names is not None and 0 <= idx < len(names):
+        return _np_to_chw(_draw_text(a, f'GT: {names[idx]} ({idx})'))
+    return _np_to_chw(_draw_text(a, f'GT: {idx}'))
+
+
+def annotate_reid(img, pid, camid=None):
+    """ReID：左上角 'ID xxx cam y'（reid 无空间标签，只能文字）。"""
+    a = _chw_to_np(img)
+    txt = f'ID {int(pid)}' + (f' cam {int(camid)}' if camid is not None else '')
+    return _np_to_chw(_draw_text(a, txt))
+
+
+DET_COLORS = [(230, 25, 75), (60, 180, 75), (255, 225, 25), (0, 130, 200),
+              (245, 130, 48), (145, 30, 180), (70, 240, 240), (240, 50, 230),
+              (210, 245, 60), (250, 190, 212)]
+
+
+def annotate_det(img, boxes, labels, class_names=None, width=2):
+    """检测：GT 框 + 类名。boxes [n,4] xyxy（与 img 同一坐标系，即网络输入
+    分辨率——mmdet val pipeline 已把框随图缩放，padding 只加在右/下侧）。"""
+    from PIL import Image, ImageDraw
+    a = _chw_to_np(img)
+    im = Image.fromarray((np.clip(a, 0, 1) * 255).astype(np.uint8))
+    dr = ImageDraw.Draw(im)
+    b = boxes.detach().cpu().numpy() if torch.is_tensor(boxes) else np.asarray(boxes)
+    l = labels.detach().cpu().numpy() if torch.is_tensor(labels) else np.asarray(labels)
+    for (x0, y0, x1, y1), c in zip(b, l):
+        color = DET_COLORS[int(c) % len(DET_COLORS)]
+        dr.rectangle([float(x0), float(y0), float(x1), float(y1)],
+                     outline=color, width=width)
+        name = class_names[int(c)] if class_names is not None else str(int(c))
+        bb = dr.textbbox((x0 + 2, y0 + 1), name)
+        dr.rectangle(bb, fill=color)
+        dr.text((x0 + 2, y0 + 1), name, fill=(0, 0, 0))
+    return _np_to_chw(np.asarray(im, dtype=np.float32) / 255.0)
+
+
+def annotate_seg(img, gt, palette=None, names=None, alpha=0.35, legend_topk=3):
+    """分割：GT 半透明叠加 + 白色类边界 + 主类图例（面积前 legend_topk 的类）。
+    gt [1,H,W]/[H,W] 标签图（255 = 忽略）；palette/names 来自数据集 METAINFO，
+    None 时 palette 用固定种子随机色、图例只写类号。展示图与 gt 分辨率不同
+    时最近邻对齐（保标签离散性）。"""
+    from PIL import Image, ImageDraw
+    a = _chw_to_np(img)
+    S = a.shape[0]
+    g = gt.detach().cpu().numpy() if torch.is_tensor(gt) else np.asarray(gt)
+    g = g.squeeze().astype(np.int32)
+    if g.shape != (S, S):
+        g = np.asarray(Image.fromarray(g).resize((S, S), Image.NEAREST),
+                       dtype=np.int32)
+    valid = g != 255
+    ids = np.unique(g[valid])
+    if palette is None:
+        rng = np.random.default_rng(0)
+        palette = rng.integers(40, 255,
+                               size=(int(ids.max()) + 1 if ids.size else 1, 3))
+    palette = np.asarray(palette)
+    out = a.copy()
+    if ids.size:
+        color = palette[np.clip(g, 0, len(palette) - 1)].astype(np.float32) / 255.0
+        out[valid] = (1 - alpha) * a[valid] + alpha * color[valid]
+        # 类边界（白线）
+        edge = np.zeros_like(valid)
+        edge[:-1, :] |= g[:-1, :] != g[1:, :]
+        edge[:, :-1] |= g[:, :-1] != g[:, 1:]
+        out[edge & valid] = 1.0
+    # 图例：面积前 legend_topk 的类，左下角色块 + 类名
+    if ids.size and legend_topk > 0:
+        counts = [(int((g == i).sum()), int(i)) for i in ids]
+        top = sorted(counts, reverse=True)[:legend_topk]
+        im = Image.fromarray((np.clip(out, 0, 1) * 255).astype(np.uint8))
+        dr = ImageDraw.Draw(im)
+        y = S - 12 * len(top) - 3
+        for _, i in top:
+            name = names[i] if names is not None and i < len(names) else str(i)
+            col = tuple(int(v) for v in palette[i % len(palette)])
+            dr.rectangle([3, y, 11, y + 8], fill=col)
+            dr.text((14, y), name, fill=(255, 255, 255),
+                    stroke_width=2, stroke_fill=(0, 0, 0))
+            y += 12
+        out = np.asarray(im, dtype=np.float32) / 255.0
+    return _np_to_chw(out)
+
+
 def measure_mask_viz(model, batch, grad_fn, batch_grad=False, mask_ratio=None,
-                     guided=True, seed=0):
+                     guided=True, seed=0, ann_fn=None):
     """
     轻量化结构化掩码可视化测量——回答"这个 ckpt 当前会怎么蒙"。
 
@@ -1462,8 +1579,15 @@ def measure_mask_viz(model, batch, grad_fn, batch_grad=False, mask_ratio=None,
         guided:     True = G 引导选址（展示训练后行为）；False = 均匀随机
                     （预热期行为）
         seed:       掩码采样的专用种子（CRN：跨 ckpt 同图同噪声，严格可比）
+        ann_fn:     callable(im, i) -> 标注后图像（[3,S,S]，0~1，tensor/数组），
+                    im 为第 i 张展示图（torch [3,S,S]）。各任务用 annotate_*
+                    助手把 GT 画到原图上（cls 类名 / det 框 / seg 叠加 /
+                    reid ID 文本）；None = 原图直出。标注只进 img_gt 展示列，
+                    不影响任何测量量。
     Returns: dict ——
         img_s   [N,3,S,S]   [0,1] 图像（resize 到扩散网格 S²，与其他量对齐）
+        img_gt  [N,3,S,S]   GT 标注后的原图（仅 ann_fn 给定时存在；同一批图
+                            跨 ckpt 相同，每个缓存各存一份仅为拼图自洽）
         g_block [N,1,g,g]   块级 G（块内均值）
         prob    [N,1,g,g]   块级采样概率 softmax(h)（guided=False 时均匀）
         mask    [N,1,g,g]   keep-mask（1=保留，0=被蒙）
@@ -1502,7 +1626,7 @@ def measure_mask_viz(model, batch, grad_fn, batch_grad=False, mask_ratio=None,
 
     # ---- 块级概率 + 现采掩码（CRN：专用种子生成器按图序取数，跨 ckpt 同噪声）----
     gen = torch.Generator().manual_seed(seed)
-    img_s, g_blocks, probs, keeps, maskeds = [], [], [], [], []
+    img_s, img_gt, g_blocks, probs, keeps, maskeds = [], [], [], [], [], []
     for i in range(N):
         hm = F.adaptive_avg_pool2d(gmaps[i], (S, S))     # 与训练同：先池到 S²
         h = F.adaptive_avg_pool2d(hm, (g, g))            # [1,1,g,g] 块内均值
@@ -1528,46 +1652,56 @@ def measure_mask_viz(model, batch, grad_fn, batch_grad=False, mask_ratio=None,
         c = im.mean(dim=(2, 3), keepdim=True)
         masked = (w * im + (1.0 - w) * c).clamp(0, 1)
         img_s.append(im)
+        if ann_fn is not None:
+            img_gt.append(_np_to_chw(_chw_to_np(ann_fn(im[0], i))))
         g_blocks.append(h)
         probs.append(prob.view(1, 1, g, g))
         keeps.append(keep)
         maskeds.append(masked)
 
     keep_cat = torch.cat(keeps, 0)
-    return {'img_s': torch.cat(img_s, 0), 'g_block': torch.cat(g_blocks, 0),
-            'prob': torch.cat(probs, 0), 'mask': keep_cat,
-            'masked': torch.cat(maskeds, 0),
-            'S': S, 'g': g, 'k': k, 'ratio': ratio, 'alpha': alpha,
-            'masked_frac': (1.0 - keep_cat.float().mean(dim=(1, 2, 3)))
-            .cpu().numpy()}
+    out = {'img_s': torch.cat(img_s, 0), 'g_block': torch.cat(g_blocks, 0),
+           'prob': torch.cat(probs, 0), 'mask': keep_cat,
+           'masked': torch.cat(maskeds, 0),
+           'S': S, 'g': g, 'k': k, 'ratio': ratio, 'alpha': alpha,
+           'masked_frac': (1.0 - keep_cat.float().mean(dim=(1, 2, 3)))
+           .cpu().numpy()}
+    if ann_fn is not None:
+        out['img_gt'] = torch.stack(img_gt, 0)
+    return out
 
 
 def save_mask_viz_cache(path, res):
-    """掩码可视化结果存 npz（复画免重测）。"""
+    """掩码可视化结果存 npz（复画免重测）。img_gt（GT 标注原图）可选。"""
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    np.savez(path,
-             img_s=res['img_s'].cpu().numpy(),
-             g_block=res['g_block'].cpu().numpy(),
-             prob=res['prob'].cpu().numpy(),
-             mask=res['mask'].cpu().numpy(),
-             masked=res['masked'].cpu().numpy(),
-             masked_frac=res['masked_frac'],
-             meta=np.array([res['S'], res['g'], res['k'], res['ratio'],
-                            res['alpha']]))
+    arrs = dict(img_s=res['img_s'].cpu().numpy(),
+                g_block=res['g_block'].cpu().numpy(),
+                prob=res['prob'].cpu().numpy(),
+                mask=res['mask'].cpu().numpy(),
+                masked=res['masked'].cpu().numpy(),
+                masked_frac=res['masked_frac'],
+                meta=np.array([res['S'], res['g'], res['k'], res['ratio'],
+                               res['alpha']]))
+    if res.get('img_gt') is not None:
+        arrs['img_gt'] = res['img_gt'].cpu().numpy()
+    np.savez(path, **arrs)
 
 
 def load_mask_viz_cache(path):
     """读回 save_mask_viz_cache 存的 npz。"""
     z = np.load(path)
     S, g, k, ratio, alpha = z['meta'].tolist()
-    return {'img_s': torch.from_numpy(z['img_s']),
-            'g_block': torch.from_numpy(z['g_block']),
-            'prob': torch.from_numpy(z['prob']),
-            'mask': torch.from_numpy(z['mask']),
-            'masked': torch.from_numpy(z['masked']),
-            'masked_frac': z['masked_frac'],
-            'S': int(S), 'g': int(g), 'k': int(k),
-            'ratio': float(ratio), 'alpha': float(alpha)}
+    out = {'img_s': torch.from_numpy(z['img_s']),
+           'g_block': torch.from_numpy(z['g_block']),
+           'prob': torch.from_numpy(z['prob']),
+           'mask': torch.from_numpy(z['mask']),
+           'masked': torch.from_numpy(z['masked']),
+           'masked_frac': z['masked_frac'],
+           'S': int(S), 'g': int(g), 'k': int(k),
+           'ratio': float(ratio), 'alpha': float(alpha)}
+    if 'img_gt' in z.files:
+        out['img_gt'] = torch.from_numpy(z['img_gt'])
+    return out
 
 
 def plot_mask_viz(res, title='', save_path=None, max_images=None):
@@ -1577,7 +1711,7 @@ def plot_mask_viz(res, title='', save_path=None, max_images=None):
     k/n；x̃ 面板标题标蒙区占比（= ratio，采样定量）。
     """
     plt = _plt()
-    img = res['img_s'].cpu().numpy()
+    img = res.get('img_gt', res['img_s']).cpu().numpy()   # 有 GT 标注用标注版
     gb = res['g_block'].cpu().numpy()
     pb = res['prob'].cpu().numpy()
     mk = res['mask'].cpu().numpy()
@@ -1715,8 +1849,9 @@ def plot_mask_viz_evolution(res_list, labels, mode='masked', max_images=4,
             if r == 0 and mode == 'masked':
                 ax.set_title(f'img {c}', fontsize=9)
             if c == 0:
-                ax.set_ylabel(labels[r], fontsize=9, rotation=0,
-                              ha='right', va='center')
+                # axis('off') 会连 ylabel 一起抹掉——用 text 画行标签
+                ax.text(-0.06, 0.5, labels[r], transform=ax.transAxes,
+                        fontsize=9, rotation=90, ha='right', va='center')
     supt = {'masked': 'masked input evolution',
             'prob': 'mask sampling prob evolution',
             'g': f'G heatmap evolution (norm={norm})'}[mode]

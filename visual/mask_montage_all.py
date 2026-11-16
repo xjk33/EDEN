@@ -77,6 +77,9 @@ STAGES = {k: None for k in TASKS}
 
 DPI = 200                     # 论文图分辨率
 
+# 列标题：早/中/晚（具体对应哪个 ckpt 运行时会打印，供写图注用）
+STAGE_LABELS = ['Early', 'Mid', 'Late']
+
 
 # =====================================================================
 # 缓存读取（与 probe_core.save_mask_viz_cache 的布局对应；不依赖 probe_core，
@@ -85,10 +88,11 @@ DPI = 200                     # 论文图分辨率
 def load_cache(path):
     """读一个 ckpt 的掩码缓存。Returns: dict ——
     img_s [N,3,S,S] / prob [N,1,g,g] / g_block / mask / masked [N,3,S,S] /
-    masked_frac [N] / S / g / k / ratio / alpha"""
+    img_gt [N,3,S,S]（可选，GT 标注原图）/ masked_frac [N] / S / g / k / ratio / alpha"""
     z = np.load(path)
     S, g, k, ratio, alpha = z['meta'].tolist()
     return {'img_s': z['img_s'], 'g_block': z['g_block'],
+            'img_gt': z['img_gt'] if 'img_gt' in z.files else None,
             'prob': z['prob'], 'mask': z['mask'], 'masked': z['masked'],
             'masked_frac': z['masked_frac'],
             'S': int(S), 'g': int(g), 'k': int(k),
@@ -172,10 +176,12 @@ def plot_mask_montage(task_panels, mode='masked', save_path=None, dpi=DPI,
                              squeeze=False)
     im = None
     for r, p in enumerate(rows):
-        # 第 0 列：原图（各阶段共用同一张）
+        # 第 0 列：原图（各阶段共用同一张；有 GT 标注时已是标注版）
         axes[r, 0].imshow(p['img'].transpose(1, 2, 0))
-        axes[r, 0].set_ylabel(p['name'], fontsize=9, rotation=0,
-                              ha='right', va='center')
+        axes[r, 0].axis('off')
+        # 行标签（任务名）：axis('off') 会连 ylabel 一起抹掉，用 text 画
+        axes[r, 0].text(-0.06, 0.5, p['name'], transform=axes[r, 0].transAxes,
+                        fontsize=9, rotation=90, ha='right', va='center')
         vmin_r = vmax_r = None
         if mode in ('prob', 'g') and norm == 'row':
             rv = np.concatenate([c[1].ravel() for c in p['cells']])
@@ -203,9 +209,10 @@ def plot_mask_montage(task_panels, mode='masked', save_path=None, dpi=DPI,
                 if r == 0:
                     ax.set_title(lab, fontsize=9)
             ax.axis('off')
-        axes[r, 0].axis('off')
     if rows:
-        axes[0, 0].set_title('Original', fontsize=9)
+        axes[0, 0].set_title(
+            'Original + GT' if any(p.get('has_gt') for p in rows) else 'Original',
+            fontsize=9)
     if im is not None and norm == 'global':
         fig.colorbar(im, ax=axes.ravel().tolist(), fraction=0.02, pad=0.01)
     supt = {'masked': 'structured mask evolution (masked input)',
@@ -221,7 +228,9 @@ def plot_mask_montage(task_panels, mode='masked', save_path=None, dpi=DPI,
 
 
 def build_task_panel(key, mode):
-    """读一个任务的缓存，挑出 [原图 + 早/中/晚 cell]。"""
+    """读一个任务的缓存，挑出 [原图 + 早/中/晚 cell]。
+    原图列优先用 GT 标注版（img_gt）；阶段列标题固定 Early/Mid/Late，
+    实际对应的 ckpt tag 打印到控制台（写图注用）。"""
     cfg = TASKS[key]
     cache_dir = os.path.join(EDEN_ROOT, cfg['cache_dir'])
     picked = pick_stages(cache_dir, STAGES.get(key))
@@ -232,13 +241,23 @@ def build_task_panel(key, mode):
     src = {'masked': 'masked', 'prob': 'prob', 'g': 'g_block'}[mode]
     cells = []
     img = None
+    has_gt = False
+    tags = []
     for p in picked:
         c = load_cache(p)
+        tags.append(c['tag'])
         i = min(cfg['image_idx'], c['img_s'].shape[0] - 1)
-        img = c['img_s'][i]
+        if c['img_gt'] is not None:
+            img = c['img_gt'][i]
+            has_gt = True
+        elif img is None:
+            img = c['img_s'][i]
         arr = c[src][i]
-        cells.append((c['tag'], arr if mode == 'masked' else arr[0]))
-    return {'name': cfg['name'], 'img': img, 'cells': cells}
+        cells.append((STAGE_LABELS[len(cells)], arr if mode == 'masked' else arr[0]))
+    mapping = ', '.join(f'{l}={t}' for l, t in zip(STAGE_LABELS, tags))
+    print(f'[{key}] 阶段对应: {mapping}' + ('' if has_gt else '（无 GT 标注，'
+          '原图列为未标注版——重跑该任务 probe_mask notebook 生成）'))
+    return {'name': cfg['name'], 'img': img, 'cells': cells, 'has_gt': has_gt}
 
 
 def main():
