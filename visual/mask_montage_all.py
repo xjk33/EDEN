@@ -14,8 +14,10 @@ pc.measure_mask_viz 后用 pc.save_mask_viz_cache 存盘，本脚本只负责拼
     iter_8000_cache.npz 等             montage_masked.png / montage_prob.png
 
 图版式（与 montage_heat 一致的"一张图看懂"风格）：
-  行 = 任务；列 = [原图 | 原图+GT | Early | Mid | Late]（GT 列来自 npz 里的
-  img_gt，由 probe_mask_*.ipynb 在测量时标注；无标注的旧缓存自动回退干净原图）。
+  行 = 任务；列 = [原图 | 原图+GT | Early | Mid | Late | 蒙后输入(Late)]
+  （GT 列来自 npz 里的 img_gt，由 probe_mask_*.ipynb 在测量时标注；无标注的
+  旧缓存自动回退干净原图。末列只在 g/prob 模式加——masked 模式三列本身
+  就是蒙后输入，不重复）。
   每个任务内部用**同一张图**贯穿（image_idx 可配，跨阶段 CRN 同图同噪声），
   列标题标出该阶段对应的 ckpt tag。
   - montage_g.png：     任务敏感度 G 热力演化（原图在最左列，论文主图）
@@ -145,7 +147,8 @@ def _plt():
 
 def plot_mask_montage(task_panels, mode='masked', save_path=None, dpi=DPI,
                       norm=None):
-    """四任务掩码拼图：行 = 任务，列 = [原图 | 原图+GT | Early | Mid | Late]。
+    """四任务掩码拼图：行 = 任务，
+    列 = [原图 | 原图+GT | Early | Mid | Late | 蒙后输入(Late，仅 g/prob)]。
 
     task_panels: list of dict ——
         {'name': str, 'img': [3,S,S] 原图,
@@ -166,7 +169,11 @@ def plot_mask_montage(task_panels, mode='masked', save_path=None, dpi=DPI,
               '（先跑各任务的 probe_mask_*.ipynb 产出 cache）')
         return None
     n_r = len(rows)
-    n_c = 2 + max(len(p['cells']) for p in rows)   # 原图 | 原图+GT | 早/中/晚
+    # 列：原图 | 原图+GT | 早/中/晚 [| Late 蒙后输入（masked 模式三列已是蒙后
+    # 输入，不重复加）]
+    extra_masked = mode != 'masked' and all(
+        p.get('masked_late') is not None for p in rows)
+    n_c = 2 + max(len(p['cells']) for p in rows) + (1 if extra_masked else 0)
 
     vmin = vmax = None
     if mode in ('prob', 'g') and norm == 'global':
@@ -211,9 +218,16 @@ def plot_mask_montage(task_panels, mode='masked', save_path=None, dpi=DPI,
                 if r == 0:
                     ax.set_title(lab, fontsize=9)
             ax.axis('off')
+        # 末列：Late 阶段的蒙后输入（模型最终实际看到的退化图）
+        if extra_masked:
+            ax = axes[r, n_c - 1]
+            ax.imshow(p['masked_late'].transpose(1, 2, 0))
+            ax.axis('off')
     if rows:
         axes[0, 0].set_title('Original', fontsize=9)
         axes[0, 1].set_title('Original + GT', fontsize=9)
+        if extra_masked:
+            axes[0, n_c - 1].set_title('Masked input (Late)', fontsize=9)
     if im is not None and norm == 'global':
         fig.colorbar(im, ax=axes.ravel().tolist(), fraction=0.02, pad=0.01)
     supt = {'masked': 'structured mask evolution (masked input)',
@@ -242,6 +256,7 @@ def build_task_panel(key, mode):
     cells = []
     img = None
     img_gt = None
+    masked_late = None
     tags = []
     for p in picked:
         c = load_cache(p)
@@ -251,6 +266,7 @@ def build_task_panel(key, mode):
             img = c['img_s'][i]
         if img_gt is None and c['img_gt'] is not None:
             img_gt = c['img_gt'][i]
+        masked_late = c['masked'][i]      # 循环结束即 Late 阶段的蒙后输入
         arr = c[src][i]
         cells.append((STAGE_LABELS[len(cells)], arr if mode == 'masked' else arr[0]))
     mapping = ', '.join(f'{l}={t}' for l, t in zip(STAGE_LABELS, tags))
@@ -258,6 +274,7 @@ def build_task_panel(key, mode):
           '原图+标签列显示未标注版——重跑该任务 probe_mask notebook 生成）'))
     return {'name': cfg['name'], 'img': img,
             'img_gt': img_gt if img_gt is not None else img,
+            'masked_late': masked_late,
             'has_gt': img_gt is not None, 'cells': cells}
 
 
