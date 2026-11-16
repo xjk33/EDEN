@@ -157,12 +157,13 @@ def plot_mask_montage(task_panels, mode='masked', save_path=None, dpi=DPI,
         mode='prob' / 'g' 时 = [g,g] 热力。
     norm（仅 prob/g）：'global' 全图共享色标（幅度可比，但任务间 G 量级
         差可达数个数量级，小值行会全黑）；'row' 每任务行共享（保留该任务
-        的阶段间幅度演化）；'panel' 逐 cell 自适应（只看空间 pattern）。
-        None = 'g' 用 'panel'、'prob' 用 'global'。
+        的阶段间幅度演化，行右侧附 colorbar 标出颜色↔数值对应）；
+        'panel' 逐 cell 自适应（只看空间 pattern，cell 下小字标 max）。
+        None = 'g' 用 'row'、'prob' 用 'global'。
     """
     plt = _plt()
     if norm is None:
-        norm = 'panel' if mode == 'g' else 'global'
+        norm = 'row' if mode == 'g' else 'global'
     rows = [p for p in task_panels if p is not None and p['cells']]
     if not rows:
         print('[plot_mask_montage] 没有任何任务数据，跳过'
@@ -195,6 +196,7 @@ def plot_mask_montage(task_panels, mode='masked', save_path=None, dpi=DPI,
         if mode in ('prob', 'g') and norm == 'row':
             rv = np.concatenate([c[1].ravel() for c in p['cells']])
             vmin_r, vmax_r = float(rv.min()), float(rv.max())
+        im_r, heat_axes = None, []
         for c in range(2, n_c):
             ax = axes[r, c]
             if c - 2 < len(p['cells']):
@@ -209,6 +211,8 @@ def plot_mask_montage(task_panels, mode='masked', save_path=None, dpi=DPI,
                         kw = dict(vmin=vmin_r, vmax=vmax_r)
                     im = ax.imshow(cell, cmap='turbo', interpolation='nearest',
                                    **kw)
+                    im_r = im
+                    heat_axes.append(ax)
                     # panel 归一化抹掉了量纲——把各 panel 的 max 以小字注回，
                     # 幅度演化的信息不丢（G 的量纲随训练进程变化是现象本身）
                     if norm == 'panel':
@@ -223,6 +227,10 @@ def plot_mask_montage(task_panels, mode='masked', save_path=None, dpi=DPI,
             ax = axes[r, n_c - 1]
             ax.imshow(p['masked_late'].transpose(1, 2, 0))
             ax.axis('off')
+        # 行共享色标时：行右侧加 colorbar，标出颜色↔敏感度数值对应
+        if norm == 'row' and im_r is not None:
+            cb = fig.colorbar(im_r, ax=heat_axes, fraction=0.035, pad=0.02)
+            cb.ax.tick_params(labelsize=6)
     if rows:
         axes[0, 0].set_title('Original', fontsize=9)
         axes[0, 1].set_title('Original + GT', fontsize=9)
@@ -234,7 +242,24 @@ def plot_mask_montage(task_panels, mode='masked', save_path=None, dpi=DPI,
             'prob': 'mask sampling probability evolution',
             'g': f'task sensitivity G evolution (norm={norm})'}[mode]
     fig.suptitle(supt, fontsize=11)
-    fig.tight_layout()
+    # 热力模式给右侧示意条预留 6% 宽度
+    fig.tight_layout(rect=(0, 0, 0.94 if mode in ('g', 'prob') else 1, 1))
+    # 图右侧统一示意条：颜色渐变 ≡ 信号强弱（turbo，上强下弱，不绑真实
+    # 数值——纯图例，读者一眼读懂热力图颜色含义；仅热力模式加）
+    if mode in ('g', 'prob'):
+        grad = np.linspace(1, 0, 256).reshape(-1, 1)
+        cax = fig.add_axes([0.952, 0.16, 0.010, 0.62])
+        cax.imshow(grad, cmap='turbo', aspect='auto')
+        cax.set_xticks([]); cax.set_yticks([])
+        for sp in cax.spines.values():
+            sp.set_linewidth(0.5)
+        lab = {'g': 'sensitivity', 'prob': 'sampling\nprob.'}[mode]
+        cax.text(2.0, 1.0, 'strong', transform=cax.transAxes,
+                 fontsize=7, ha='left', va='center')
+        cax.text(2.0, 0.0, 'weak', transform=cax.transAxes,
+                 fontsize=7, ha='left', va='center')
+        cax.text(5.2, 0.5, lab, transform=cax.transAxes, fontsize=8,
+                 rotation=90, ha='center', va='center')
     if save_path:
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
         fig.savefig(save_path, dpi=dpi, bbox_inches='tight')
@@ -293,7 +318,7 @@ def main():
                          '--stages cls=ckpt_epoch_0,ckpt_epoch_6,ckpt_epoch_11'
                          '（可多次）')
     ap.add_argument('--norm', default=None, choices=['global', 'row', 'panel'],
-                    help='prob/g 热力的色标归一化（默认 g=panel, prob=global）')
+                    help='prob/g 热力的色标归一化（默认 g=row, prob=global）')
     args = ap.parse_args()
     keys = args.tasks or list(TASKS)
     for k in keys:
