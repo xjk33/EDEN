@@ -347,8 +347,17 @@ def plot_montage(task_snaps, kind='pt', save_path=None):
         else:
             W = np.stack([s['t_weight'] for s in snaps])
             im = ax.imshow(W, aspect='auto', cmap='viridis')
-            ax.set_yticks(range(len(snaps)))
-            ax.set_yticklabels([s['tag'] for s in snaps], fontsize=7)
+            # 纵轴不写具体 ckpt：行从上到下 = 训练演进（图注里说明），
+            # 左侧画向下箭头作简单图例
+            ax.set_yticks([])
+            ax.annotate('', xy=(-0.035, 0.0), xytext=(-0.035, 1.0),
+                        xycoords='axes fraction',
+                        arrowprops=dict(arrowstyle='-|>', color='0.35',
+                                        lw=1.2),
+                        annotation_clip=False)
+            ax.text(-0.075, 0.5, 'training progresses', rotation=90,
+                    transform=ax.transAxes, va='center', ha='center',
+                    fontsize=8, color='0.35')
             ax.set_xticks(range(W.shape[1]))
             ax.set_xticklabels([str(t) for t in snaps[0]['rep_t']],
                                rotation=45, fontsize=6)
