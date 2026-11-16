@@ -14,7 +14,8 @@ pc.measure_mask_viz 后用 pc.save_mask_viz_cache 存盘，本脚本只负责拼
     iter_8000_cache.npz 等             montage_masked.png / montage_prob.png
 
 图版式（与 montage_heat 一致的"一张图看懂"风格）：
-  行 = 任务；列 = [原图 | 早期 | 中期 | 晚期] —— 4 任务 × 4 列。
+  行 = 任务；列 = [原图 | 原图+GT | Early | Mid | Late]（GT 列来自 npz 里的
+  img_gt，由 probe_mask_*.ipynb 在测量时标注；无标注的旧缓存自动回退干净原图）。
   每个任务内部用**同一张图**贯穿（image_idx 可配，跨阶段 CRN 同图同噪声），
   列标题标出该阶段对应的 ckpt tag。
   - montage_g.png：     任务敏感度 G 热力演化（原图在最左列，论文主图）
@@ -144,7 +145,7 @@ def _plt():
 
 def plot_mask_montage(task_panels, mode='masked', save_path=None, dpi=DPI,
                       norm=None):
-    """四任务掩码拼图：行 = 任务，列 = [原图 | 早期 | 中期 | 晚期]。
+    """四任务掩码拼图：行 = 任务，列 = [原图 | 原图+GT | Early | Mid | Late]。
 
     task_panels: list of dict ——
         {'name': str, 'img': [3,S,S] 原图,
@@ -165,7 +166,7 @@ def plot_mask_montage(task_panels, mode='masked', save_path=None, dpi=DPI,
               '（先跑各任务的 probe_mask_*.ipynb 产出 cache）')
         return None
     n_r = len(rows)
-    n_c = 1 + max(len(p['cells']) for p in rows)
+    n_c = 2 + max(len(p['cells']) for p in rows)   # 原图 | 原图+GT | 早/中/晚
 
     vmin = vmax = None
     if mode in ('prob', 'g') and norm == 'global':
@@ -176,9 +177,10 @@ def plot_mask_montage(task_panels, mode='masked', save_path=None, dpi=DPI,
                              squeeze=False)
     im = None
     for r, p in enumerate(rows):
-        # 第 0 列：原图（各阶段共用同一张；有 GT 标注时已是标注版）
-        axes[r, 0].imshow(p['img'].transpose(1, 2, 0))
-        axes[r, 0].axis('off')
+        # 第 0/1 列：干净原图 | 原图+GT 标注（各阶段共用同一张）
+        for ci, key in ((0, 'img'), (1, 'img_gt')):
+            axes[r, ci].imshow(p[key].transpose(1, 2, 0))
+            axes[r, ci].axis('off')
         # 行标签（任务名）：axis('off') 会连 ylabel 一起抹掉，用 text 画
         axes[r, 0].text(-0.06, 0.5, p['name'], transform=axes[r, 0].transAxes,
                         fontsize=9, rotation=90, ha='right', va='center')
@@ -186,10 +188,10 @@ def plot_mask_montage(task_panels, mode='masked', save_path=None, dpi=DPI,
         if mode in ('prob', 'g') and norm == 'row':
             rv = np.concatenate([c[1].ravel() for c in p['cells']])
             vmin_r, vmax_r = float(rv.min()), float(rv.max())
-        for c in range(1, n_c):
+        for c in range(2, n_c):
             ax = axes[r, c]
-            if c - 1 < len(p['cells']):
-                lab, cell = p['cells'][c - 1]
+            if c - 2 < len(p['cells']):
+                lab, cell = p['cells'][c - 2]
                 if mode == 'masked':
                     ax.imshow(cell.transpose(1, 2, 0))
                 else:
@@ -210,9 +212,8 @@ def plot_mask_montage(task_panels, mode='masked', save_path=None, dpi=DPI,
                     ax.set_title(lab, fontsize=9)
             ax.axis('off')
     if rows:
-        axes[0, 0].set_title(
-            'Original + GT' if any(p.get('has_gt') for p in rows) else 'Original',
-            fontsize=9)
+        axes[0, 0].set_title('Original', fontsize=9)
+        axes[0, 1].set_title('Original + GT', fontsize=9)
     if im is not None and norm == 'global':
         fig.colorbar(im, ax=axes.ravel().tolist(), fraction=0.02, pad=0.01)
     supt = {'masked': 'structured mask evolution (masked input)',
@@ -228,9 +229,8 @@ def plot_mask_montage(task_panels, mode='masked', save_path=None, dpi=DPI,
 
 
 def build_task_panel(key, mode):
-    """读一个任务的缓存，挑出 [原图 + 早/中/晚 cell]。
-    原图列优先用 GT 标注版（img_gt）；阶段列标题固定 Early/Mid/Late，
-    实际对应的 ckpt tag 打印到控制台（写图注用）。"""
+    """读一个任务的缓存，挑出 [原图 + 原图+GT + 早/中/晚 cell]。
+    阶段列标题固定 Early/Mid/Late，实际对应的 ckpt tag 打印到控制台（写图注用）。"""
     cfg = TASKS[key]
     cache_dir = os.path.join(EDEN_ROOT, cfg['cache_dir'])
     picked = pick_stages(cache_dir, STAGES.get(key))
@@ -241,23 +241,24 @@ def build_task_panel(key, mode):
     src = {'masked': 'masked', 'prob': 'prob', 'g': 'g_block'}[mode]
     cells = []
     img = None
-    has_gt = False
+    img_gt = None
     tags = []
     for p in picked:
         c = load_cache(p)
         tags.append(c['tag'])
         i = min(cfg['image_idx'], c['img_s'].shape[0] - 1)
-        if c['img_gt'] is not None:
-            img = c['img_gt'][i]
-            has_gt = True
-        elif img is None:
+        if img is None:
             img = c['img_s'][i]
+        if img_gt is None and c['img_gt'] is not None:
+            img_gt = c['img_gt'][i]
         arr = c[src][i]
         cells.append((STAGE_LABELS[len(cells)], arr if mode == 'masked' else arr[0]))
     mapping = ', '.join(f'{l}={t}' for l, t in zip(STAGE_LABELS, tags))
-    print(f'[{key}] 阶段对应: {mapping}' + ('' if has_gt else '（无 GT 标注，'
-          '原图列为未标注版——重跑该任务 probe_mask notebook 生成）'))
-    return {'name': cfg['name'], 'img': img, 'cells': cells, 'has_gt': has_gt}
+    print(f'[{key}] 阶段对应: {mapping}' + ('' if img_gt is not None else '（无 GT 标注，'
+          '原图+标签列显示未标注版——重跑该任务 probe_mask notebook 生成）'))
+    return {'name': cfg['name'], 'img': img,
+            'img_gt': img_gt if img_gt is not None else img,
+            'has_gt': img_gt is not None, 'cells': cells}
 
 
 def main():
