@@ -1239,12 +1239,15 @@ def plot_mask_meta(res, title='', save_path=None, max_images=None, mask_alpha=1.
         axes[i, 0].imshow(im0)
         axes[i, 0].set_title('image', fontsize=10)
         ip_pos = np.clip(ip[i, 0], 0, None)              # 正部：只有正贡献参与选址
+        pk_ip = ip_pos.max() / max(ip_pos.mean(), 1e-30)  # 峰值倍数：1=完全均匀，越大越集中
         im1 = axes[i, 1].imshow(ip_pos, cmap='turbo')
-        axes[i, 1].set_title('meta IP <g_task, g_den> (pos)', fontsize=10)
+        axes[i, 1].set_title(f'meta IP <g_task, g_den> (pos, pk={pk_ip:.1f}x)',
+                             fontsize=10)
         fig.colorbar(im1, ax=axes[i, 1], fraction=0.046)
+        pk_g = gb[i, 0].max() / max(gb[i, 0].mean(), 1e-30)
         im2 = axes[i, 2].imshow(gb[i, 0], cmap='turbo')
         axes[i, 2].set_title(
-            f'proxy G = |g_task| (ρ_s={res["rho_s"][i]:.2f}, '
+            f'proxy G = |g_task| (pk={pk_g:.1f}x, ρ_s={res["rho_s"][i]:.2f}, '
             f'r_p={res["rho_p"][i]:.2f})', fontsize=10)
         fig.colorbar(im2, ax=axes[i, 2], fraction=0.046)
 
