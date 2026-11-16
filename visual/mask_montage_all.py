@@ -157,9 +157,10 @@ def plot_mask_montage(task_panels, mode='masked', save_path=None, dpi=DPI,
         mode='prob' / 'g' 时 = [g,g] 热力。
     norm（仅 prob/g）：'global' 全图共享色标（幅度可比，但任务间 G 量级
         差可达数个数量级，小值行会全黑）；'row' 每任务行共享（保留该任务
-        的阶段间幅度演化，行右侧附 colorbar 标出颜色↔数值对应）；
-        'panel' 逐 cell 自适应（只看空间 pattern，cell 下小字标 max）。
-        None = 'g' 用 'row'、'prob' 用 'global'。
+        的阶段间幅度演化）；'panel' 逐 cell 自适应（只看空间 pattern，
+        cell 下小字标 max）。None = 'g' 用 'row'、'prob' 用 'global'。
+        热力模式不画数值 colorbar——图右侧统一一条示意渐变条（上强下弱），
+        只表达"颜色 ≡ 信号强弱"，不绑真实数值。
     """
     plt = _plt()
     if norm is None:
@@ -183,7 +184,6 @@ def plot_mask_montage(task_panels, mode='masked', save_path=None, dpi=DPI,
 
     fig, axes = plt.subplots(n_r, n_c, figsize=(2.4 * n_c, 2.5 * n_r + 0.4),
                              squeeze=False)
-    im = None
     for r, p in enumerate(rows):
         # 第 0/1 列：干净原图 | 原图+GT 标注（各阶段共用同一张）
         for ci, key in ((0, 'img'), (1, 'img_gt')):
@@ -196,7 +196,6 @@ def plot_mask_montage(task_panels, mode='masked', save_path=None, dpi=DPI,
         if mode in ('prob', 'g') and norm == 'row':
             rv = np.concatenate([c[1].ravel() for c in p['cells']])
             vmin_r, vmax_r = float(rv.min()), float(rv.max())
-        im_r, heat_axes = None, []
         for c in range(2, n_c):
             ax = axes[r, c]
             if c - 2 < len(p['cells']):
@@ -209,10 +208,7 @@ def plot_mask_montage(task_panels, mode='masked', save_path=None, dpi=DPI,
                         kw = dict(vmin=vmin, vmax=vmax)
                     elif norm == 'row':
                         kw = dict(vmin=vmin_r, vmax=vmax_r)
-                    im = ax.imshow(cell, cmap='turbo', interpolation='nearest',
-                                   **kw)
-                    im_r = im
-                    heat_axes.append(ax)
+                    ax.imshow(cell, cmap='turbo', interpolation='nearest', **kw)
                     # panel 归一化抹掉了量纲——把各 panel 的 max 以小字注回，
                     # 幅度演化的信息不丢（G 的量纲随训练进程变化是现象本身）
                     if norm == 'panel':
@@ -227,17 +223,11 @@ def plot_mask_montage(task_panels, mode='masked', save_path=None, dpi=DPI,
             ax = axes[r, n_c - 1]
             ax.imshow(p['masked_late'].transpose(1, 2, 0))
             ax.axis('off')
-        # 行共享色标时：行右侧加 colorbar，标出颜色↔敏感度数值对应
-        if norm == 'row' and im_r is not None:
-            cb = fig.colorbar(im_r, ax=heat_axes, fraction=0.035, pad=0.02)
-            cb.ax.tick_params(labelsize=6)
     if rows:
         axes[0, 0].set_title('Original', fontsize=9)
         axes[0, 1].set_title('Original + GT', fontsize=9)
         if extra_masked:
             axes[0, n_c - 1].set_title('Masked input (Late)', fontsize=9)
-    if im is not None and norm == 'global':
-        fig.colorbar(im, ax=axes.ravel().tolist(), fraction=0.02, pad=0.01)
     supt = {'masked': 'structured mask evolution (masked input)',
             'prob': 'mask sampling probability evolution',
             'g': f'task sensitivity G evolution (norm={norm})'}[mode]
