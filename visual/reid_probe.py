@@ -107,8 +107,15 @@ def build_reid_data(cfg):
     return val_loader, num_classes, camera_num, view_num
 
 
-def build_reid_val_batch(val_loader, num_images=8, device=None):
-    """取 val 第一个 batch 的前 num_images 张（跨 ckpt 固定同批图，严格可比）。
+def build_reid_val_batch(val_loader, num_images=8, device=None, k_per_id=4):
+    """PK 采样取 val 图（跨 ckpt 固定同批图，严格可比）。
+
+    为什么不能顺序取：triplet loss 的 hard_example_mining 里
+    dist_mat[is_pos].view(N, -1) 要求每个 anchor 的正样本数一致——训练由
+    RandomIdentitySampler 的 P×K 采样保证（每个身份恰好 K 张）。顺序取 val
+    前 N 张会让各身份图数不均（如 8 张图 26 对正样本），view 直接崩。
+    这里按 val 顺序取前 P 个图片数 >= K 的身份、各取前 K 张
+    （P = num_images // K，K 默认 4 与训练 IMS_PER_BATCH 的 K 一致）。
 
     归一化在 dataset transform 里已完成（mean/std=0.5），无需模型参与。
     Returns: dict ——
@@ -118,12 +125,30 @@ def build_reid_val_batch(val_loader, num_images=8, device=None):
     """
     if device is None:
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    assert num_images % k_per_id == 0, \
+        f'num_images={num_images} 必须整除 k_per_id={k_per_id}'
+    n_id = num_images // k_per_id
+    by_id, order = {}, []
     for (img, vid, camid, camids, target_view, _) in val_loader:
-        break
-    n = min(num_images, img.shape[0])
-    X = img[:n].to(device)
-    dsis = [(int(vid[i]), int(camids[i]), int(target_view[i]))
-            for i in range(n)]
+        for i in range(img.shape[0]):
+            v = int(vid[i])
+            if v not in by_id:
+                by_id[v] = []
+                order.append(v)
+            if len(by_id[v]) < k_per_id:
+                by_id[v].append((img[i], int(camids[i]), int(target_view[i])))
+        full = [v for v in order if len(by_id[v]) >= k_per_id]
+        if len(full) >= n_id:
+            break
+    picked = [v for v in order if len(by_id[v]) >= k_per_id][:n_id]
+    assert len(picked) == n_id, (
+        f'val 集里凑不满 {n_id} 个有 {k_per_id} 张图的身份'
+        f'（只找到 {len(picked)} 个）——减小 num_images 或 k_per_id')
+    items = [it for v in picked for it in by_id[v]]
+    X = torch.stack([it[0] for it in items]).to(device)
+    dsis = [(picked[i // k_per_id], it[1], it[2])
+            for i, it in enumerate(items)]
+    n = X.shape[0]
     img01 = [(X[i:i + 1] * 0.5 + 0.5).clamp(0, 1) for i in range(n)]
     return {'xis': [X[i:i + 1] for i in range(n)], 'dsis': dsis,
             'img01': img01}
