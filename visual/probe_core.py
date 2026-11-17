@@ -1243,47 +1243,64 @@ def plot_mask_meta(res, title='', save_path=None, max_images=None, mask_alpha=1.
         c = im0.reshape(-1, 3).mean(axis=0)
         return np.clip(w[..., None] * im0 + (1.0 - w)[..., None] * c, 0, 1)
 
+    # 列标题只放首行（短名称，避免与 colorbar 重叠）；逐图定量读数改为
+    # 各面板左下角白底小字标注（bbox 垫底，不遮内容、不与 colorbar 冲突）。
+    def _corner(ax, s):
+        ax.text(0.02, 0.03, s, transform=ax.transAxes, fontsize=7,
+                va='bottom', ha='left',
+                bbox=dict(facecolor='white', alpha=0.65, edgecolor='none',
+                          pad=1.2))
+
     fig, axes = plt.subplots(n, n_col, figsize=(3.3 * n_col, 3.4 * n))
     if n == 1:
         axes = axes[None, :]
     for i in range(n):
         im0 = img[i].permute(1, 2, 0).cpu().numpy()
         axes[i, 0].imshow(im0)
-        axes[i, 0].set_title('image', fontsize=10)
+        if i == 0:
+            axes[i, 0].set_title('image', fontsize=10)
         c0 = 1
         if img_gt is not None:
             axes[i, 1].imshow(img_gt[i].permute(1, 2, 0).cpu().numpy())
-            axes[i, 1].set_title('image + GT', fontsize=10)
+            if i == 0:
+                axes[i, 1].set_title('image + GT', fontsize=10)
             c0 = 2
         ip_pos = np.clip(ip[i, 0], 0, None)              # 正部：只有正贡献参与选址
         pk_ip = ip_pos.max() / max(ip_pos.mean(), 1e-30)  # 峰值倍数：1=完全均匀，越大越集中
         im1 = axes[i, c0].imshow(ip_pos, cmap='turbo')
-        axes[i, c0].set_title(f'meta IP <g_task, g_den> (pos, pk={pk_ip:.1f}x)',
-                              fontsize=10)
+        if i == 0:
+            axes[i, c0].set_title(r'meta IP $\langle g_{\mathrm{task}},'
+                                  r' g_{\mathrm{den}}\rangle$ (pos)',
+                                  fontsize=10)
+        _corner(axes[i, c0], f'pk={pk_ip:.1f}x')
         fig.colorbar(im1, ax=axes[i, c0], fraction=0.046)
         pk_g = gb[i, 0].max() / max(gb[i, 0].mean(), 1e-30)
         im2 = axes[i, c0 + 1].imshow(gb[i, 0], cmap='turbo')
-        axes[i, c0 + 1].set_title(
-            f'proxy G = |g_task| (pk={pk_g:.1f}x, ρ_s={res["rho_s"][i]:.2f}, '
-            f'r_p={res["rho_p"][i]:.2f})', fontsize=10)
+        if i == 0:
+            axes[i, c0 + 1].set_title(r'proxy G $=|g_{\mathrm{task}}|$',
+                                      fontsize=10)
+        _corner(axes[i, c0 + 1],
+                f'pk={pk_g:.1f}x  ρ_s={res["rho_s"][i]:.2f}  '
+                f'r_p={res["rho_p"][i]:.2f}')
         fig.colorbar(im2, ax=axes[i, c0 + 1], fraction=0.046)
 
         col = c0 + 2
         if mk_ip is not None:
             axes[i, col].imshow(_soft_overlay(im0, mk_ip[i, 0]))
-            axes[i, col].set_title(f'IP-mask x~0 (alpha={mask_alpha:g}, '
-                                   f'masked={1 - mk_ip[i, 0].mean():.2f})',
-                                   fontsize=10)
+            if i == 0:
+                axes[i, col].set_title(r'IP-mask $\tilde{x}_0$', fontsize=10)
+            _corner(axes[i, col], f'masked={1 - mk_ip[i, 0].mean():.2f}')
             col += 1
             a, b = 1.0 - mk[i, 0], 1.0 - mk_ip[i, 0]     # 蒙区 IoU
             union = np.clip((a + b - a * b).sum(), 1e-12, None)
             iou = float((a * b).sum() / union)
-            g_title = f'G-mask x~0 (alpha={mask_alpha:g}, IoU={iou:.2f})'
+            g_note = f'IoU={iou:.2f}'
         else:
-            g_title = (f'G-mask x~0 (alpha={mask_alpha:g}, '
-                       f'masked={1 - mk[i, 0].mean():.2f})')
+            g_note = f'masked={1 - mk[i, 0].mean():.2f}'
         axes[i, col].imshow(_soft_overlay(im0, mk[i, 0]))
-        axes[i, col].set_title(g_title, fontsize=10)
+        if i == 0:
+            axes[i, col].set_title(r'G-mask $\tilde{x}_0$', fontsize=10)
+        _corner(axes[i, col], g_note)
         for j in range(n_col):
             axes[i, j].axis('off')
     if title:
