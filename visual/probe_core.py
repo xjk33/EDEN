@@ -1416,6 +1416,36 @@ def plot_loss_variance_evolution(results, labels, save_path=None):
     return fig
 
 
+def plot_loss_variance_evolution_split(results, labels, save_paths=None):
+    """与 plot_loss_variance_evolution 相同的数据，但 CV(D) 与 |SNR(D)| 各成一张
+    单栏图并分别保存（论文里需要分开引用时用）。
+    save_paths: (cv_path, snr_path)；返回 (fig_cv, fig_snr)。"""
+    plt = _plt()
+    figs = []
+    for panel in ('cv', 'snr'):
+        fig, ax = plt.subplots(figsize=(6.5, 4.2))
+        for res, lab in zip(results, labels):
+            t, c = res['t'], res['arm_c']
+            y = c['d_cv'] if panel == 'cv' else np.abs(c['d_snr'])
+            ax.plot(t, y, lw=2, marker='o', ms=3, label=lab)
+        if panel == 'cv':
+            ax.set_title('CV(D) across checkpoints [arm C]')
+            ax.set_ylabel('CV(D)')
+        else:
+            ax.axhline(1.0, color='k', ls='--', lw=1)
+            ax.set_yscale('log')
+            ax.set_title('|SNR(D)| across checkpoints [arm C]')
+            ax.set_ylabel('|SNR(D)|')
+        ax.set_xlabel('t'); ax.grid(alpha=0.3); ax.legend(fontsize=8)
+        fig.tight_layout()
+        figs.append(fig)
+    if save_paths:
+        for fig, p in zip(figs, save_paths):
+            if p:
+                fig.savefig(p, dpi=150)
+    return tuple(figs)
+
+
 def plot_grad_cos_variance(gres, title='', save_path=None):
     """可选第四臂：cos<g_task, g_diff(t)> 的逐实现分布（mean ± std 带 + 散点）。"""
     plt = _plt()
